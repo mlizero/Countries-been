@@ -1,17 +1,8 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { OrbitControls, Stars, RoundedBox, MeshDistortMaterial } from '@react-three/drei';
+import { OrbitControls, Stars, RoundedBox, MeshDistortMaterial, Html } from '@react-three/drei';
 import * as THREE from 'three';
 import countryColorsData from './countriesColors.json';
-
-// Easing "back out" : dépasse légèrement 1 puis revient, donne un effet de
-// "pop"/rebond naturel quand le personnage prend forme (utile pour l'arrivée
-// sur la terre ferme après la chaloupe).
-function easeOutBack(x) {
-  const c1 = 1.70158;
-  const c3 = c1 + 1;
-  return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
-}
 
 // 1. Mathématiques : Projette la géométrie et les collisions
 function projectGeometryToSphere(geometry, baseRadius = 5) {
@@ -34,6 +25,37 @@ function projectGeometryToSphere(geometry, baseRadius = 5) {
   geometry.computeVertexNormals();
   geometry.computeBoundingBox();
   geometry.computeBoundingSphere();
+}
+
+// Un polygone de pays n'a souvent que quelques sommets espacés de dizaines de
+// degrés (dataset volontairement low-poly). Or projectGeometryToSphere ne
+// déplace QUE les sommets sur la sphère : les faces plates ENTRE deux sommets
+// éloignés restent des cordes qui "coupent" sous la surface de la sphère
+// (le milieu d'un grand triangle plat est plus proche du centre que ses
+// coins). Pour un grand pays (Russie, Canada...), cet affaissement peut
+// largement dépasser la marge de 0.05 laissée avant l'océan, et le pays
+// semble alors passer sous l'eau en son centre. On corrige en insérant des
+// points intermédiaires le long des arêtes du polygone AVANT extrusion, pour
+// qu'aucun triangle ne couvre plus que `maxStepDeg` degrés d'un coup.
+function densifyRing(ring, maxStepDeg = 3) {
+  if (!ring || ring.length < 2) return ring;
+  const out = [];
+  for (let i = 0; i < ring.length - 1; i++) {
+    const [lon1, lat1] = ring[i];
+    const [lon2, lat2] = ring[i + 1];
+    out.push([lon1, lat1]);
+    const dLon = lon2 - lon1;
+    const dLat = lat2 - lat1;
+    if (Math.abs(dLon) > 180) continue; // évite les faux raccords à l'antiméridien
+    const dist = Math.sqrt(dLon * dLon + dLat * dLat);
+    const steps = Math.min(20, Math.max(1, Math.ceil(dist / maxStepDeg)));
+    for (let s = 1; s < steps; s++) {
+      const t = s / steps;
+      out.push([lon1 + dLon * t, lat1 + dLat * t]);
+    }
+  }
+  out.push(ring[ring.length - 1]);
+  return out;
 }
 
 function pointInPolygon(point, vs) {
@@ -145,14 +167,6 @@ const BoatWithRider = ({ oarRef, transitionProgress }) => {
         <RoundedBox args={[0.095, 0.095, 0.095]} radius={0.02} smoothness={3} position={[0, 0.2, 0]} castShadow>
           <meshStandardMaterial color={skinColor} flatShading={true} />
         </RoundedBox>
-        {/* Petite touffe de cheveux (cohérente avec le personnage à pied) */}
-        <mesh position={[0, 0.253, 0.005]} castShadow>
-          <sphereGeometry args={[0.05, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.55]} />
-          <meshStandardMaterial color="#3B2412" flatShading={true} />
-        </mesh>
-        {/* Yeux — ce groupe est tourné à 180° (rotation={[0, Math.PI, 0]} ci-dessus),
-            donc on les place en z positif ici pour qu'ils pointent dans la même
-            direction relative que sur terre ferme (dos tourné vers la caméra). */}
         <mesh position={[-0.02, 0.2, 0.045]}>
           <sphereGeometry args={[0.008, 6, 6]} />
           <meshStandardMaterial color="#2b2b2b" />
@@ -189,26 +203,14 @@ const BoatWithRider = ({ oarRef, transitionProgress }) => {
 // Torse et tête en RoundedBox (coins adoucis) + membres en capsules pour un
 // rendu low-poly plus "mignon" que des pavés bruts, tout en gardant la même
 // hiérarchie de refs (legL/legR/armL/armR/bodyRef) pour ne pas casser l'animation.
-const Stickman = ({ legL, legR, armL, armR, bodyRef, showFlagInHand, transitionProgress = 1, walkBob = 0, walkLean = 0 }) => {
+const Stickman = ({ legL, legR, armL, armR, bodyRef, showFlagInHand }) => {
   const skinColor = "#FFC3A0"; 
   const shirtColor = "#FF5733"; 
   const pantsColor = "#1E40AF"; 
   const hairColor = "#3B2412";
 
-  // transitionProgress passe de 0 à 1 juste après avoir quitté la chaloupe :
-  // ça sert à faire "apparaître" le personnage sur la terre ferme avec un
-  // petit rebond (au lieu d'un pop instantané comme avant).
-  const p = Math.min(1, Math.max(0, transitionProgress));
-  const landScale = THREE.MathUtils.lerp(0.4, 1, easeOutBack(p));
-  const hopOffset = Math.sin(p * Math.PI) * 0.1;
-
   return (
     <group ref={bodyRef} position={[0, 0.15, 0]}>
-      <group
-        scale={[landScale, landScale, landScale]}
-        position={[0, hopOffset + walkBob, 0]}
-        rotation={[walkLean, 0, 0]}
-      >
       {/* Tête */}
       <RoundedBox args={[0.1, 0.1, 0.1]} radius={0.022} smoothness={3} position={[0, 0.25, 0]} castShadow>
         <meshStandardMaterial color={skinColor} flatShading={true} />
@@ -218,10 +220,7 @@ const Stickman = ({ legL, legR, armL, armR, bodyRef, showFlagInHand, transitionP
         <sphereGeometry args={[0.052, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.55]} />
         <meshStandardMaterial color={hairColor} flatShading={true} />
       </mesh>
-      {/* Yeux — placés en z négatif : le personnage tourne le dos à la caméra
-          (comme dans un jeu en 3e personne classique), face tournée dans le
-          sens de la marche. Avant ce fix, ils étaient en z positif et le
-          personnage donnait l'impression de "moonwalker" en avançant. */}
+      {/* Yeux */}
       <mesh position={[-0.025, 0.255, -0.05]}>
         <sphereGeometry args={[0.009, 6, 6]} />
         <meshStandardMaterial color="#2b2b2b" />
@@ -276,7 +275,6 @@ const Stickman = ({ legL, legR, armL, armR, bodyRef, showFlagInHand, transitionP
           <capsuleGeometry args={[0.02, 0.09, 4, 6]} />
           <meshStandardMaterial color={pantsColor} flatShading={true} />
         </mesh>
-      </group>
       </group>
     </group>
   );
@@ -355,8 +353,101 @@ const FlagMarker = ({ position, countryName, onClick }) => {
   );
 };
 
-// 5. Composant Player
-const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onLocationChange, onPlantFlag, visitedFlags }) => {
+// Anime la caméra vers un pays sélectionné (zoom façon Google Maps / Wanderlog),
+// puis la ramène à sa position précédente à la fermeture. Se monte à
+// l'intérieur du <Canvas> pour avoir accès à `camera` via useThree.
+const CameraFocusRig = ({ focusFlag, onSettled }) => {
+  const { camera } = useThree();
+  const savedPos = useRef(null);
+  const wasFocused = useRef(false);
+
+  useEffect(() => {
+    if (focusFlag && !wasFocused.current) {
+      // On démarre un zoom : on mémorise d'où on partait pour pouvoir y revenir.
+      savedPos.current = camera.position.clone();
+    }
+    wasFocused.current = !!focusFlag;
+  }, [focusFlag, camera]);
+
+  useFrame(() => {
+    if (focusFlag) {
+      const pos = focusFlag.position;
+      const normal = pos.clone().normalize();
+      let tangent = new THREE.Vector3(0, 1, 0).sub(normal.clone().multiplyScalar(normal.y));
+      if (tangent.lengthSq() < 1e-6) tangent.set(1, 0, 0);
+      tangent.normalize();
+      // Position la caméra au-dessus du pays, légèrement en retrait pour un
+      // angle de vue 3/4 plutôt qu'un plongée verticale plate.
+      const target = pos.clone()
+        .add(normal.clone().multiplyScalar(2.3))
+        .sub(tangent.clone().multiplyScalar(1.15));
+      camera.position.lerp(target, 0.07);
+      camera.up.lerp(normal, 0.1);
+      camera.lookAt(pos);
+    } else if (savedPos.current) {
+      camera.position.lerp(savedPos.current, 0.09);
+      camera.up.lerp(new THREE.Vector3(0, 1, 0), 0.09);
+      camera.lookAt(0, 0, 0);
+      if (camera.position.distanceTo(savedPos.current) < 0.05) {
+        savedPos.current = null;
+        if (onSettled) onSettled();
+      }
+    }
+  });
+
+  return null;
+};
+
+// Grand nom du pays flottant au-dessus du point zoomé sur le globe (ancré en
+// coordonnées 3D via drei/Html, donc reste "collé" au bon endroit du globe).
+const CountryZoomLabel = ({ flag }) => {
+  if (!flag) return null;
+  return (
+    <Html position={flag.position} center distanceFactor={6} zIndexRange={[5, 0]} occlude>
+      <div
+        key={flag.country}
+        style={{
+          fontSize: 26, fontWeight: 800, color: '#fff', whiteSpace: 'nowrap',
+          textShadow: '0 2px 12px rgba(0,0,0,0.85), 0 0 30px rgba(74,222,128,0.5)',
+          fontFamily: 'system-ui, sans-serif', pointerEvents: 'none',
+          animation: 'countryLabelIn 0.5s cubic-bezier(0.2, 0.8, 0.2, 1)',
+        }}
+      >
+        {flag.country}
+      </div>
+    </Html>
+  );
+};
+
+// Notation sur 10, en étoiles cliquables avec prévisualisation au survol.
+const RatingStars = ({ value = 0, onChange, size = 18 }) => (
+  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+    <div style={{ display: 'flex', gap: 2 }}>
+      {Array.from({ length: 10 }).map((_, i) => {
+        const idx = i + 1;
+        return (
+          <span
+            key={idx}
+            onClick={() => onChange(idx === value ? 0 : idx)}
+            style={{
+              cursor: 'pointer', fontSize: size, lineHeight: 1,
+              color: idx <= value ? '#FACC15' : 'rgba(255,255,255,0.25)',
+              transition: 'color 0.15s, transform 0.15s',
+            }}
+            onMouseEnter={(e) => { e.currentTarget.style.transform = 'scale(1.2)'; }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = 'scale(1)'; }}
+          >
+            ★
+          </span>
+        );
+      })}
+    </div>
+    <span style={{ fontSize: 13, opacity: 0.7, minWidth: 32 }}>{value}/10</span>
+  </div>
+);
+
+
+const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onLocationChange, onPlantFlag, visitedFlags, cameraLocked }) => {
   const playerRef = useRef();
   const { camera } = useThree();
   
@@ -372,55 +463,16 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
   const keys = useRef({ z: false, q: false, s: false, d: false, space: false });
   const [isOnWater, setIsOnWater] = useState(false);
   const [showFlagInHand, setShowFlagInHand] = useState(false);
-  const [transitionProgress, setTransitionProgress] = useState(1);
+  const [transitionProgress, setTransitionProgress] = useState(0);
   
   const isPlacingFlag = useRef(false);
   const plantAnimTime = useRef(0);
   const currentCountryRef = useRef(null);
   const prevWaterState = useRef(false);
-  const transitionStartTime = useRef(-10);
-  // Anti-flapping : près des archipels (nord du Canada, Indonésie...), la
-  // position peut traverser terre/eau plusieurs fois par seconde. On retarde
-  // l'état "acté" jusqu'à ce que le nouvel état tienne un court instant.
+  const transitionStartTime = useRef(0);
   const pendingWaterState = useRef(null);
   const pendingSince = useRef(0);
-  const WATER_STATE_DEBOUNCE = 0.12; // secondes
-  const walkAnim = useRef({ bob: 0, lean: 0 });
-
-  // Pool de particules réutilisées pour l'éclaboussure terre/eau (évite de
-  // créer/détruire des meshes en continu, donc quasi gratuit en perf).
-  const SPLASH_COUNT = 14;
-  const splashMeshes = useRef([]);
-  const splashData = useRef(
-    Array.from({ length: SPLASH_COUNT }, () => ({
-      life: 999,
-      maxLife: 1,
-      vel: new THREE.Vector3(),
-      pos: new THREE.Vector3(),
-    }))
-  );
-
-  const spawnSplash = (origin, normal) => {
-    // Deux vecteurs tangents au plan perpendiculaire à la normale du globe à
-    // cet endroit, pour disperser les particules "à plat" sur la surface de l'eau.
-    let helper = new THREE.Vector3(0, 1, 0);
-    if (Math.abs(normal.dot(helper)) > 0.9) helper = new THREE.Vector3(1, 0, 0);
-    const t1 = new THREE.Vector3().crossVectors(normal, helper).normalize();
-    const t2 = new THREE.Vector3().crossVectors(normal, t1).normalize();
-
-    splashData.current.forEach((p) => {
-      const angle = Math.random() * Math.PI * 2;
-      const outward = 0.02 + Math.random() * 0.035;
-      const up = 0.03 + Math.random() * 0.035;
-      p.vel
-        .copy(t1).multiplyScalar(Math.cos(angle) * outward)
-        .addScaledVector(t2, Math.sin(angle) * outward)
-        .addScaledVector(normal, up);
-      p.pos.copy(origin);
-      p.life = 0;
-      p.maxLife = 0.35 + Math.random() * 0.25;
-    });
-  };
+  const WATER_STATE_DEBOUNCE = 0.22;
 
   useEffect(() => {
     if (controlMode !== 'zqsd') return;
@@ -451,15 +503,15 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
     };
   }, [controlMode]);
 
-  useFrame(({ clock }, delta) => {
+  useFrame(({ clock }) => {
     if (!playerRef.current) return;
 
     let isMoving = false;
     const radius = 5.12;
 
     if (controlMode === 'zqsd') {
-      const moveSpeed = 0.025;
-      const rotateSpeed = 0.02;
+      const moveSpeed = 0.035;
+      const rotateSpeed = 0.04;
 
       const hasFlagHere = currentCountryRef.current && visitedFlags.some(f => f.country === currentCountryRef.current);
 
@@ -529,32 +581,25 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
       const currentCountry = getCountryAtPosition(lat, lon, countriesData);
       currentCountryRef.current = currentCountry;
       const rawWaterState = !currentCountry;
-      const now = clock.getElapsedTime();
+      const nowT = clock.getElapsedTime();
 
       if (rawWaterState !== prevWaterState.current) {
-        // On vient (peut-être) de changer d'état : on ne l'acte pas tout de
-        // suite, on note juste depuis quand ce nouvel état est "candidat".
         if (pendingWaterState.current !== rawWaterState) {
           pendingWaterState.current = rawWaterState;
-          pendingSince.current = now;
-        } else if (now - pendingSince.current > WATER_STATE_DEBOUNCE) {
-          // Le nouvel état a tenu assez longtemps : on l'acte pour de bon.
+          pendingSince.current = nowT;
+        } else if (nowT - pendingSince.current > WATER_STATE_DEBOUNCE) {
           prevWaterState.current = rawWaterState;
-          transitionStartTime.current = now;
-          spawnSplash(playerPos.current, upNormal);
+          transitionStartTime.current = nowT;
           pendingWaterState.current = null;
         }
       } else {
-        // On est revenu à l'état déjà acté avant la fin du délai : on annule
-        // le changement en attente (évite le clignotement bateau/pas bateau).
         pendingWaterState.current = null;
       }
-
       const waterState = prevWaterState.current;
 
-      const tTrans = now - transitionStartTime.current;
+      const tTrans = nowT - transitionStartTime.current;
       const progress = Math.min(1, tTrans / 0.6);
-      setTransitionProgress(progress);
+      setTransitionProgress(waterState ? progress : (1 - progress));
 
       setIsOnWater(waterState);
       if (onWaterChange) onWaterChange(waterState);
@@ -565,11 +610,11 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
         .add(backwardDir.multiplyScalar(2.8))
         .add(upNormal.multiplyScalar(5.0));
 
-      camera.position.lerp(idealCameraPos, 0.15);
-      camera.up.copy(upNormal);
-      const camLookMatrix = new THREE.Matrix4().lookAt(camera.position, playerPos.current, upNormal);
-      const camTargetQuat = new THREE.Quaternion().setFromRotationMatrix(camLookMatrix);
-      camera.quaternion.slerp(camTargetQuat, 0.68);
+      if (!cameraLocked) {
+        camera.position.lerp(idealCameraPos, 0.15);
+        camera.up.copy(upNormal);
+        camera.lookAt(playerPos.current);
+      }
 
     } else if (controlMode === 'click' && targetPosition) {
       const currentPos = playerRef.current.position;
@@ -596,11 +641,6 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
         if (legR.current) legR.current.rotation.x = Math.sin(t + Math.PI) * angle;
         if (armL.current) armL.current.rotation.x = Math.sin(t + Math.PI) * angle;
         if (armR.current) armR.current.rotation.x = Math.sin(t) * angle;
-        // Rebond du buste : deux "rebonds" par cycle de jambe (un par appui au
-        // sol) + une légère inclinaison vers l'avant, pour casser l'effet
-        // "glisse sur des rails" d'un simple sin() sur les membres.
-        walkAnim.current.bob = Math.abs(Math.sin(t)) * 0.018;
-        walkAnim.current.lean = THREE.MathUtils.lerp(walkAnim.current.lean, -0.07, 0.15);
       } else {
         if (oarRef.current) oarRef.current.rotation.z = Math.sin(t) * 0.4;
       }
@@ -614,68 +654,19 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
       if (oarRef.current) {
         oarRef.current.rotation.z = THREE.MathUtils.lerp(oarRef.current.rotation.z, 0, 0.1);
       }
-      walkAnim.current.bob = THREE.MathUtils.lerp(walkAnim.current.bob, 0, 0.15);
-      walkAnim.current.lean = THREE.MathUtils.lerp(walkAnim.current.lean, 0, 0.15);
     }
-
-    // Anime le pool de particules d'éclaboussure (mouvement + amortissement +
-    // fondu), indépendamment du mode de contrôle courant.
-    splashData.current.forEach((p, i) => {
-      const mesh = splashMeshes.current[i];
-      if (!mesh) return;
-      if (p.life < p.maxLife) {
-        p.life += delta;
-        p.pos.addScaledVector(p.vel, delta * 60);
-        p.vel.multiplyScalar(0.9);
-        const lifeT = p.life / p.maxLife;
-        mesh.visible = true;
-        mesh.position.copy(p.pos);
-        const s = THREE.MathUtils.lerp(1, 0.15, lifeT);
-        mesh.scale.setScalar(s);
-        if (mesh.material) mesh.material.opacity = 1 - lifeT;
-      } else if (mesh.visible) {
-        mesh.visible = false;
-      }
-    });
   });
 
   return (
-    <>
-      <group ref={playerRef} position={[0, 5.12, 0]}>
-        {isOnWater ? (
-          <BoatWithRider oarRef={oarRef} transitionProgress={transitionProgress} />
-        ) : (
-          <Stickman
-            legL={legL}
-            legR={legR}
-            armL={armL}
-            armR={armR}
-            bodyRef={bodyRef}
-            showFlagInHand={showFlagInHand}
-            transitionProgress={transitionProgress}
-            walkBob={walkAnim.current.bob}
-            walkLean={walkAnim.current.lean}
-          />
-        )}
-      </group>
-      <SplashParticles meshesRef={splashMeshes} count={SPLASH_COUNT} />
-    </>
+    <group ref={playerRef} position={[0, 5.12, 0]}>
+      {isOnWater ? (
+        <BoatWithRider oarRef={oarRef} transitionProgress={transitionProgress} />
+      ) : (
+        <Stickman legL={legL} legR={legR} armL={armL} armR={armR} bodyRef={bodyRef} showFlagInHand={showFlagInHand} />
+      )}
+    </group>
   );
 };
-
-// Rendu séparé du pool de particules d'éclaboussure : ce groupe reste en
-// coordonnées MONDE (pas d'attache au joueur), sinon les particules
-// hériteraient de sa rotation et partiraient dans le mauvais sens.
-const SplashParticles = ({ meshesRef, count }) => (
-  <group>
-    {Array.from({ length: count }).map((_, i) => (
-      <mesh key={i} ref={(el) => { if (el) meshesRef.current[i] = el; }} visible={false}>
-        <sphereGeometry args={[0.03, 6, 6]} />
-        <meshBasicMaterial color="#BFDBFE" transparent opacity={0} depthWrite={false} />
-      </mesh>
-    ))}
-  </group>
-);
 
 // 6. Un Pays Individuel
 const CountryMesh = ({ feature, onHover, onClick, controlMode, activeCountry }) => {
@@ -687,8 +678,9 @@ const CountryMesh = ({ feature, onHover, onClick, controlMode, activeCountry }) 
     const coordinates = type === 'Polygon' ? [feature.geometry.coordinates] : feature.geometry.coordinates;
 
     coordinates.forEach((polygonCoords) => {
-      const outerRing = polygonCoords[0];
-      if (!outerRing || outerRing.length < 3) return;
+      const rawRing = polygonCoords[0];
+      if (!rawRing || rawRing.length < 3) return;
+      const outerRing = densifyRing(rawRing, 3);
 
       const shape = new THREE.Shape();
       outerRing.forEach(([lon, lat], index) => {
@@ -805,12 +797,23 @@ const TravelPortfolioScene = () => {
   
   const [visitedFlags, setVisitedFlags] = useState([]);
   const [activePopupFlag, setActivePopupFlag] = useState(null);
-  const [noteContent, setNoteContent] = useState('');
+  const [returningCamera, setReturningCamera] = useState(false);
+
+  // Contenu éditable du panneau (brouillon local tant qu'on n'a pas cliqué "Enregistrer")
+  const [panelNotes, setPanelNotes] = useState('');
+  const [panelRating, setPanelRating] = useState(0);
+  const [panelPhotos, setPanelPhotos] = useState([]);
+
+  // Fiche Wikipédia (photo de couverture + extrait) du pays affiché dans le panneau
+  const [wikiInfo, setWikiInfo] = useState(null);
+  const [wikiLoading, setWikiLoading] = useState(false);
+
+  const cameraLocked = !!activePopupFlag || returningCamera;
 
   const handlePlantFlag = (position) => {
     if (!selectedCountry || isOnWater) return;
     if (!visitedFlags.some(f => f.country === selectedCountry)) {
-      setVisitedFlags(prev => [...prev, { country: selectedCountry, position, notes: 'Mes notes de voyage ici...' }]);
+      setVisitedFlags(prev => [...prev, { country: selectedCountry, position, notes: '', rating: 0, photos: [] }]);
     }
   };
 
@@ -818,9 +821,69 @@ const TravelPortfolioScene = () => {
     const found = visitedFlags.find(f => f.country === name);
     if (found) {
       setActivePopupFlag(found);
-      setNoteContent(found.notes);
+      setPanelNotes(found.notes || '');
+      setPanelRating(found.rating || 0);
+      setPanelPhotos(found.photos || []);
     }
   };
+
+  const closePanel = () => {
+    setActivePopupFlag(null);
+    setReturningCamera(true);
+  };
+
+  const savePanel = () => {
+    if (!activePopupFlag) return;
+    setVisitedFlags(prev => prev.map(f =>
+      f.country === activePopupFlag.country
+        ? { ...f, notes: panelNotes, rating: panelRating, photos: panelPhotos }
+        : f
+    ));
+    closePanel();
+  };
+
+  const deleteFlag = (countryName) => {
+    if (!window.confirm(`Supprimer le drapeau planté sur ${countryName} ? Cette action est irréversible.`)) return;
+    setVisitedFlags(prev => prev.filter(f => f.country !== countryName));
+    if (activePopupFlag?.country === countryName) closePanel();
+  };
+
+  const handlePhotoUpload = (e) => {
+    const files = Array.from(e.target.files || []);
+    files.forEach((file) => {
+      const reader = new FileReader();
+      reader.onload = () => setPanelPhotos((prev) => [...prev, reader.result]);
+      reader.readAsDataURL(file);
+    });
+    e.target.value = '';
+  };
+
+  const removePanelPhoto = (idx) => {
+    setPanelPhotos((prev) => prev.filter((_, i) => i !== idx));
+  };
+
+  // Récupère une photo de couverture + un court résumé depuis Wikipédia pour
+  // le pays actuellement affiché dans le panneau (API publique, sans clé).
+  useEffect(() => {
+    if (!activePopupFlag) return;
+    let cancelled = false;
+    setWikiInfo(null);
+    setWikiLoading(true);
+    fetch(`https://en.wikipedia.org/api/rest_v1/page/summary/${encodeURIComponent(activePopupFlag.country)}`)
+      .then((res) => { if (!res.ok) throw new Error('not found'); return res.json(); })
+      .then((data) => {
+        if (cancelled) return;
+        setWikiInfo({
+          thumbnail: data.thumbnail?.source || data.originalimage?.source || null,
+          extract: data.extract || '',
+          pageUrl: data.content_urls?.desktop?.page || `https://en.wikipedia.org/wiki/${encodeURIComponent(activePopupFlag.country)}`,
+        });
+      })
+      .catch(() => { if (!cancelled) setWikiInfo(null); })
+      .finally(() => { if (!cancelled) setWikiLoading(false); });
+    return () => { cancelled = true; };
+  }, [activePopupFlag?.country]);
+
 
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#090d16', overflow: 'hidden', position: 'relative' }}>
@@ -847,15 +910,24 @@ const TravelPortfolioScene = () => {
         {visitedFlags.length === 0 ? (
           <p style={{ margin: 0, fontSize: '12px', opacity: 0.6 }}>Aucun drapeau planté.</p>
         ) : (
-          <ul style={{ margin: 0, paddingLeft: '18px', display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          <ul style={{ margin: 0, paddingLeft: 0, listStyle: 'none', display: 'flex', flexDirection: 'column', gap: '6px' }}>
             {visitedFlags.map((flag, idx) => (
-              <li key={idx} style={{ fontSize: '13px' }}>
+              <li key={idx} style={{ fontSize: '13px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6 }}>
                 <span 
                   onClick={() => openCountryNote(flag.country)}
-                  style={{ cursor: 'pointer', textDecoration: 'underline', color: '#60A5FA' }}
+                  style={{ cursor: 'pointer', textDecoration: 'underline', color: '#60A5FA', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
                 >
-                  {flag.country}
+                  {flag.country}{flag.rating > 0 ? ` · ${flag.rating}/10` : ''}
                 </span>
+                <button
+                  onClick={(e) => { e.stopPropagation(); deleteFlag(flag.country); }}
+                  title="Supprimer ce drapeau"
+                  style={{ flexShrink: 0, background: 'none', border: 'none', color: 'rgba(255,255,255,0.4)', cursor: 'pointer', fontSize: 14, padding: '0 2px' }}
+                  onMouseEnter={(e) => { e.currentTarget.style.color = '#EF4444'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.color = 'rgba(255,255,255,0.4)'; }}
+                >
+                  ✕
+                </button>
               </li>
             ))}
           </ul>
@@ -886,6 +958,7 @@ const TravelPortfolioScene = () => {
           }}
           onPlantFlag={handlePlantFlag}
           visitedFlags={visitedFlags}
+          cameraLocked={cameraLocked}
         />
 
         <GlobeWithCountries 
@@ -909,33 +982,141 @@ const TravelPortfolioScene = () => {
             onClick={openCountryNote} 
           />
         ))}
+
+        <CameraFocusRig focusFlag={activePopupFlag} onSettled={() => setReturningCamera(false)} />
+        <CountryZoomLabel flag={activePopupFlag} />
         
-        <OrbitControls enablePan={false} enableRotate={controlMode === 'click'} minDistance={6} maxDistance={20} />
+        {!cameraLocked && (
+          <OrbitControls enablePan={false} enableRotate={controlMode === 'click'} minDistance={6} maxDistance={20} />
+        )}
       </Canvas>
 
-      {/* Pop-up des Notes */}
+      {/* Animations CSS (label géant sur le globe + glissement du panneau) */}
+      <style>{`
+        @keyframes countryLabelIn {
+          from { opacity: 0; transform: scale(0.7) translateY(10px); }
+          to { opacity: 1; transform: scale(1) translateY(0); }
+        }
+        @keyframes panelFadeIn {
+          from { opacity: 0; transform: translateX(24px); }
+          to { opacity: 1; transform: translateX(0); }
+        }
+      `}</style>
+
+      {/* Panneau latéral façon Wanderlog / Google Maps : infos + notes du pays */}
       {activePopupFlag && (
-        <div style={{ position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)', width: '320px', background: 'rgba(15, 23, 42, 0.95)', border: '1px solid rgba(255,255,255,0.2)', padding: '20px', borderRadius: '12px', zIndex: 100, color: '#fff', boxShadow: '0 20px 25px -5px rgba(0, 0, 0, 0.5)' }}>
-          <h2 style={{ margin: '0 0 10px 0', fontSize: '20px', color: '#4ADE80' }}>Drapeau : {activePopupFlag.country}</h2>
-          <p style={{ margin: '0 0 10px 0', fontSize: '13px', opacity: 0.8 }}>Remplissez vos souvenirs ou infos pour ce pays :</p>
-          <textarea 
-            value={noteContent} 
-            onChange={(e) => setNoteContent(e.target.value)}
-            style={{ width: '100%', height: '100px', background: 'rgba(255,255,255,0.1)', border: '1px solid rgba(255,255,255,0.2)', borderRadius: '6px', color: '#fff', padding: '10px', resize: 'none', boxSizing: 'border-box' }}
-          />
-          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '10px', marginTop: '15px' }}>
+        <div
+          key={activePopupFlag.country}
+          style={{
+            position: 'absolute', top: 0, right: 0, height: '100vh', width: 380, maxWidth: '92vw',
+            background: 'rgba(15, 23, 42, 0.97)', borderLeft: '1px solid rgba(255,255,255,0.15)',
+            zIndex: 100, color: '#fff', boxShadow: '-20px 0 40px -10px rgba(0,0,0,0.6)',
+            display: 'flex', flexDirection: 'column', animation: 'panelFadeIn 0.35s cubic-bezier(0.2,0.8,0.2,1)',
+          }}
+        >
+          {/* Photo de couverture (Wikipédia) */}
+          <div style={{ position: 'relative', width: '100%', height: 190, flexShrink: 0, background: '#1e293b' }}>
+            {wikiLoading && (
+              <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, opacity: 0.6 }}>
+                Chargement de la photo...
+              </div>
+            )}
+            {!wikiLoading && wikiInfo?.thumbnail && (
+              <img src={wikiInfo.thumbnail} alt={activePopupFlag.country} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />
+            )}
+            {!wikiLoading && !wikiInfo?.thumbnail && (
+              <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 40, opacity: 0.3 }}>
+                🌍
+              </div>
+            )}
+            <div style={{ position: 'absolute', inset: 0, background: 'linear-gradient(180deg, rgba(0,0,0,0) 40%, rgba(15,23,42,0.95) 100%)' }} />
+            <button
+              onClick={closePanel}
+              style={{ position: 'absolute', top: 14, right: 14, width: 32, height: 32, borderRadius: '50%', border: 'none', background: 'rgba(0,0,0,0.5)', color: '#fff', cursor: 'pointer', fontSize: 16, lineHeight: '32px', textAlign: 'center' }}
+            >
+              ✕
+            </button>
+            <h2 style={{ position: 'absolute', bottom: 12, left: 18, margin: 0, fontSize: 24, fontWeight: 800 }}>
+              {activePopupFlag.country}
+            </h2>
+          </div>
+
+          <div style={{ flex: 1, overflowY: 'auto', padding: '16px 18px 90px' }}>
+            {/* Extrait Wikipédia */}
+            {wikiInfo?.extract && (
+              <p style={{ margin: '0 0 16px 0', fontSize: 12.5, lineHeight: 1.5, opacity: 0.75 }}>
+                {wikiInfo.extract.length > 280 ? wikiInfo.extract.slice(0, 280) + '…' : wikiInfo.extract}
+                {' '}
+                <a href={wikiInfo.pageUrl} target="_blank" rel="noreferrer" style={{ color: '#60A5FA' }}>Wikipédia ↗</a>
+              </p>
+            )}
+
+            {/* Ma note sur 10 */}
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.6, opacity: 0.6, marginBottom: 6 }}>Ma note</div>
+              <RatingStars value={panelRating} onChange={setPanelRating} />
+            </div>
+
+            {/* Mes photos de voyage */}
+            <div style={{ marginBottom: 18 }}>
+              <div style={{ fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.6, opacity: 0.6, marginBottom: 8 }}>Mes photos</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8 }}>
+                {panelPhotos.map((src, idx) => (
+                  <div key={idx} style={{ position: 'relative', paddingTop: '100%', borderRadius: 8, overflow: 'hidden', background: '#1e293b' }}>
+                    <img src={src} alt="" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' }} />
+                    <button
+                      onClick={() => removePanelPhoto(idx)}
+                      title="Supprimer cette photo"
+                      style={{ position: 'absolute', top: 3, right: 3, width: 20, height: 20, borderRadius: '50%', border: 'none', background: 'rgba(0,0,0,0.65)', color: '#fff', fontSize: 11, cursor: 'pointer', lineHeight: '20px', textAlign: 'center', padding: 0 }}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                <label
+                  style={{
+                    paddingTop: '100%', position: 'relative', borderRadius: 8, cursor: 'pointer',
+                    border: '1.5px dashed rgba(255,255,255,0.25)', display: 'block',
+                  }}
+                >
+                  <input type="file" accept="image/*" multiple onChange={handlePhotoUpload} style={{ display: 'none' }} />
+                  <span style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22, opacity: 0.5 }}>
+                    +
+                  </span>
+                </label>
+              </div>
+            </div>
+
+            {/* Mes notes */}
+            <div>
+              <div style={{ fontSize: 12, textTransform: 'uppercase', letterSpacing: 0.6, opacity: 0.6, marginBottom: 8 }}>Mes souvenirs</div>
+              <textarea 
+                value={panelNotes} 
+                onChange={(e) => setPanelNotes(e.target.value)}
+                placeholder="Écrivez vos souvenirs, anecdotes, adresses à retenir..."
+                style={{ width: '100%', height: '140px', background: 'rgba(255,255,255,0.06)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: '8px', color: '#fff', padding: '10px', resize: 'vertical', boxSizing: 'border-box', fontFamily: 'inherit', fontSize: 13 }}
+              />
+            </div>
+          </div>
+
+          {/* Barre d'actions fixe en bas du panneau */}
+          <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, display: 'flex', gap: 10, padding: 16, background: 'rgba(15, 23, 42, 0.97)', borderTop: '1px solid rgba(255,255,255,0.1)' }}>
             <button 
-              onClick={() => {
-                setVisitedFlags(visitedFlags.map(f => f.country === activePopupFlag.country ? { ...f, notes: noteContent } : f));
-                setActivePopupFlag(null);
-              }}
-              style={{ padding: '6px 12px', background: '#4ADE80', border: 'none', borderRadius: '6px', fontWeight: 'bold', cursor: 'pointer' }}
+              onClick={savePanel}
+              style={{ flex: 1, padding: '10px 12px', background: '#4ADE80', border: 'none', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer' }}
             >
               Enregistrer
             </button>
             <button 
-              onClick={() => setActivePopupFlag(null)}
-              style={{ padding: '6px 12px', background: 'rgba(255,255,255,0.2)', color: '#fff', border: 'none', borderRadius: '6px', cursor: 'pointer' }}
+              onClick={() => deleteFlag(activePopupFlag.country)}
+              title="Supprimer ce drapeau"
+              style={{ padding: '10px 14px', background: 'rgba(239,68,68,0.15)', color: '#EF4444', border: '1px solid rgba(239,68,68,0.4)', borderRadius: '8px', cursor: 'pointer' }}
+            >
+              🗑
+            </button>
+            <button 
+              onClick={closePanel}
+              style={{ padding: '10px 14px', background: 'rgba(255,255,255,0.1)', color: '#fff', border: 'none', borderRadius: '8px', cursor: 'pointer' }}
             >
               Fermer
             </button>
