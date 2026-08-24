@@ -1,6 +1,7 @@
 import React, { useRef, useState, useEffect, useMemo } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { OrbitControls, Stars, RoundedBox, MeshDistortMaterial, Html } from '@react-three/drei';
+import { Stars, RoundedBox, MeshDistortMaterial, Html } from '@react-three/drei';
+import { EffectComposer, Bloom } from '@react-three/postprocessing';
 import * as THREE from 'three';
 import countryColorsData from './countriesColors.json';
 
@@ -58,6 +59,83 @@ function densifyRing(ring, maxStepDeg = 3) {
   return out;
 }
 
+// densifyRing() ne densifie que le CONTOUR du polygone. Mais la triangulation
+// interne (earcut, utilisée par ExtrudeGeometry) peut quand même produire de
+// grands triangles reliant des points du contour à travers l'INTÉRIEUR d'un
+// pays très étendu (typiquement la Russie, dont la silhouette est large et
+// simple) — même avec un contour dense. Ces grands triangles plats "coupent"
+// sous la vraie courbure de la sphère en leur centre, ce qui donne
+// l'impression que le pays passe sous le niveau de la mer alors que le
+// joueur y est bien détecté (la détection, elle, utilise le contour 2D brut,
+// pas le maillage 3D). On corrige ça en subdivisant TOUT le maillage (donc y
+// compris les diagonales internes d'earcut) tant qu'une arête dépasse
+// `maxEdgeLen` degrés, avant de le projeter sur la sphère.
+function subdivideFlatGeometry(geometry, maxEdgeLen = 2.2, maxIterations = 6) {
+  let positions = Array.from(geometry.attributes.position.array);
+
+  for (let iter = 0; iter < maxIterations; iter++) {
+    let changed = false;
+    const next = [];
+    for (let i = 0; i < positions.length; i += 9) {
+      const ax = positions[i], ay = positions[i + 1], az = positions[i + 2];
+      const bx = positions[i + 3], by = positions[i + 4], bz = positions[i + 5];
+      const cx = positions[i + 6], cy = positions[i + 7], cz = positions[i + 8];
+      const ab = Math.hypot(bx - ax, by - ay, bz - az);
+      const bc = Math.hypot(cx - bx, cy - by, cz - bz);
+      const ca = Math.hypot(ax - cx, ay - cy, az - cz);
+      const longest = Math.max(ab, bc, ca);
+
+      if (longest > maxEdgeLen) {
+        changed = true;
+        // Coupe le triangle en 2 au milieu de sa plus longue arête.
+        if (longest === ab) {
+          const mx = (ax + bx) / 2, my = (ay + by) / 2, mz = (az + bz) / 2;
+          next.push(ax, ay, az, mx, my, mz, cx, cy, cz);
+          next.push(mx, my, mz, bx, by, bz, cx, cy, cz);
+        } else if (longest === bc) {
+          const mx = (bx + cx) / 2, my = (by + cy) / 2, mz = (bz + cz) / 2;
+          next.push(ax, ay, az, bx, by, bz, mx, my, mz);
+          next.push(ax, ay, az, mx, my, mz, cx, cy, cz);
+        } else {
+          const mx = (cx + ax) / 2, my = (cy + ay) / 2, mz = (cz + az) / 2;
+          next.push(ax, ay, az, bx, by, bz, mx, my, mz);
+          next.push(mx, my, mz, bx, by, bz, cx, cy, cz);
+        }
+      } else {
+        next.push(ax, ay, az, bx, by, bz, cx, cy, cz);
+      }
+    }
+    positions = next;
+    if (!changed) break;
+  }
+
+  const out = new THREE.BufferGeometry();
+  out.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  return out;
+}
+
+// Anime un pool de particules "simples" (position + vitesse + durée de vie),
+// mutualisé entre l'éclaboussure, le sillage du bateau et la poussière des
+// pas — seuls les réglages d'échelle/opacité/amortissement changent.
+function updateParticlePool(dataArr, meshArr, delta, { scaleFrom = 1, scaleTo = 0.15, damping = 0.9, baseOpacity = 1 } = {}) {
+  dataArr.forEach((p, i) => {
+    const mesh = meshArr[i];
+    if (!mesh) return;
+    if (p.life < p.maxLife) {
+      p.life += delta;
+      p.pos.addScaledVector(p.vel, delta * 60);
+      p.vel.multiplyScalar(damping);
+      const lifeT = p.life / p.maxLife;
+      mesh.visible = true;
+      mesh.position.copy(p.pos);
+      mesh.scale.setScalar(THREE.MathUtils.lerp(scaleFrom, scaleTo, lifeT));
+      if (mesh.material) mesh.material.opacity = (1 - lifeT) * baseOpacity;
+    } else if (mesh.visible) {
+      mesh.visible = false;
+    }
+  });
+}
+
 function pointInPolygon(point, vs) {
   const [x, y] = point;
   let inside = false;
@@ -85,6 +163,14 @@ function getCountryAtPosition(lat, lon, countriesData) {
     }
   }
   return null;
+}
+
+// Easing "back out" : dépasse légèrement 1 puis revient, effet de rebond
+// naturel utilisé pour l'arrivée sur la terre ferme après la chaloupe.
+function easeOutBack(x) {
+  const c1 = 1.70158;
+  const c3 = c1 + 1;
+  return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2);
 }
 
 // 2. Chaloupe et personnage assis
@@ -167,6 +253,11 @@ const BoatWithRider = ({ oarRef, transitionProgress }) => {
         <RoundedBox args={[0.095, 0.095, 0.095]} radius={0.02} smoothness={3} position={[0, 0.2, 0]} castShadow>
           <meshStandardMaterial color={skinColor} flatShading={true} />
         </RoundedBox>
+        {/* Petite touffe de cheveux (cohérente avec le personnage à pied) */}
+        <mesh position={[0, 0.253, 0.005]} castShadow>
+          <sphereGeometry args={[0.05, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.55]} />
+          <meshStandardMaterial color="#3B2412" flatShading={true} />
+        </mesh>
         <mesh position={[-0.02, 0.2, 0.045]}>
           <sphereGeometry args={[0.008, 6, 6]} />
           <meshStandardMaterial color="#2b2b2b" />
@@ -203,32 +294,46 @@ const BoatWithRider = ({ oarRef, transitionProgress }) => {
 // Torse et tête en RoundedBox (coins adoucis) + membres en capsules pour un
 // rendu low-poly plus "mignon" que des pavés bruts, tout en gardant la même
 // hiérarchie de refs (legL/legR/armL/armR/bodyRef) pour ne pas casser l'animation.
-const Stickman = ({ legL, legR, armL, armR, bodyRef, showFlagInHand }) => {
+const Stickman = ({ legL, legR, armL, armR, bodyRef, headRef, showFlagInHand, transitionProgress = 1, walkBob = 0, walkLean = 0, walkTilt = 0 }) => {
   const skinColor = "#FFC3A0"; 
   const shirtColor = "#FF5733"; 
   const pantsColor = "#1E40AF"; 
   const hairColor = "#3B2412";
 
+  // transitionProgress passe de 0 à 1 juste après avoir quitté la chaloupe :
+  // fait "apparaître" le personnage sur la terre ferme avec un petit rebond
+  // élastique au lieu d'un pop instantané.
+  const p = Math.min(1, Math.max(0, transitionProgress));
+  const landScale = THREE.MathUtils.lerp(0.4, 1, easeOutBack(p));
+  const hopOffset = Math.sin(p * Math.PI) * 0.1;
+
   return (
     <group ref={bodyRef} position={[0, 0.15, 0]}>
-      {/* Tête */}
-      <RoundedBox args={[0.1, 0.1, 0.1]} radius={0.022} smoothness={3} position={[0, 0.25, 0]} castShadow>
-        <meshStandardMaterial color={skinColor} flatShading={true} />
-      </RoundedBox>
-      {/* Petite touffe de cheveux */}
-      <mesh position={[0, 0.305, -0.005]} castShadow>
-        <sphereGeometry args={[0.052, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.55]} />
-        <meshStandardMaterial color={hairColor} flatShading={true} />
-      </mesh>
-      {/* Yeux */}
-      <mesh position={[-0.025, 0.255, -0.05]}>
-        <sphereGeometry args={[0.009, 6, 6]} />
-        <meshStandardMaterial color="#2b2b2b" />
-      </mesh>
-      <mesh position={[0.025, 0.255, -0.05]}>
-        <sphereGeometry args={[0.009, 6, 6]} />
-        <meshStandardMaterial color="#2b2b2b" />
-      </mesh>
+      <group
+        scale={[landScale, landScale, landScale]}
+        position={[0, hopOffset + walkBob, 0]}
+        rotation={[walkLean, 0, walkTilt]}
+      >
+      {/* Tête (groupe séparé pour pouvoir la faire pivoter seule pendant l'idle) */}
+      <group ref={headRef} position={[0, 0.25, 0]}>
+        <RoundedBox args={[0.1, 0.1, 0.1]} radius={0.022} smoothness={3} castShadow>
+          <meshStandardMaterial color={skinColor} flatShading={true} />
+        </RoundedBox>
+        {/* Petite touffe de cheveux */}
+        <mesh position={[0, 0.055, -0.005]} castShadow>
+          <sphereGeometry args={[0.052, 8, 6, 0, Math.PI * 2, 0, Math.PI * 0.55]} />
+          <meshStandardMaterial color={hairColor} flatShading={true} />
+        </mesh>
+        {/* Yeux */}
+        <mesh position={[-0.025, 0.005, -0.05]}>
+          <sphereGeometry args={[0.009, 6, 6]} />
+          <meshStandardMaterial color="#2b2b2b" />
+        </mesh>
+        <mesh position={[0.025, 0.005, -0.05]}>
+          <sphereGeometry args={[0.009, 6, 6]} />
+          <meshStandardMaterial color="#2b2b2b" />
+        </mesh>
+      </group>
 
       {/* Torse */}
       <RoundedBox args={[0.12, 0.15, 0.07]} radius={0.025} smoothness={3} position={[0, 0.1, 0]} castShadow>
@@ -275,6 +380,7 @@ const Stickman = ({ legL, legR, armL, armR, bodyRef, showFlagInHand }) => {
           <capsuleGeometry args={[0.02, 0.09, 4, 6]} />
           <meshStandardMaterial color={pantsColor} flatShading={true} />
         </mesh>
+      </group>
       </group>
     </group>
   );
@@ -336,6 +442,13 @@ const FlagMarker = ({ position, countryName, onClick }) => {
         <meshStandardMaterial color="#D4AF37" roughness={0.3} metalness={0.6} />
       </mesh>
 
+      {/* Petite lueur au pied du mât : lisible côté jour, et se détache
+          agréablement sur le côté nuit une fois le soleil rotatif passé. */}
+      <mesh position={[0, 0.01, 0]} raycast={() => null}>
+        <sphereGeometry args={[0.02, 8, 8]} />
+        <meshStandardMaterial color="#FDE68A" emissive="#FDE68A" emissiveIntensity={1.4} toneMapped={false} />
+      </mesh>
+
       {/* Le tissu du drapeau pivote légèrement au mât pour simuler le vent */}
       <group ref={clothRef} position={[0, 0.25, 0]}>
         <mesh position={[0.075, 0, 0]} castShadow raycast={() => null}>
@@ -350,6 +463,90 @@ const FlagMarker = ({ position, countryName, onClick }) => {
         )}
       </group>
     </group>
+  );
+};
+
+// Soleil qui tourne lentement autour du globe : fait apparaître un vrai
+// cycle jour/nuit (le "terminateur" balaie la sphère). On l'accompagne d'un
+// disque émissif (non tone-mappé) qui accroche le bloom, pour vraiment
+// *voir* le soleil dans le ciel plutôt qu'une simple source de lumière invisible.
+const RotatingSun = () => {
+  const groupRef = useRef();
+  useFrame(({ clock }) => {
+    if (!groupRef.current) return;
+    const t = clock.getElapsedTime() * 0.05; // vitesse du cycle (~2 min/tour)
+    const dist = 16;
+    groupRef.current.position.set(Math.cos(t) * dist, 5, Math.sin(t) * dist);
+  });
+  return (
+    <group ref={groupRef}>
+      <directionalLight intensity={1.7} castShadow />
+      <mesh>
+        <sphereGeometry args={[1.1, 24, 24]} />
+        <meshBasicMaterial color="#FFF3D0" toneMapped={false} />
+      </mesh>
+    </group>
+  );
+};
+
+// Halo bleuté supprimé à la demande (rendait le globe trop diffus). On garde
+// juste RotatingSun ci-dessus pour le cycle jour/nuit.
+
+// Ciel nébuleux généré à la volée (canvas) : dégradé spatial + quelques
+// nébuleuses douces, plutôt qu'un fond noir uni. Combiné avec <Stars/> pour
+// les points scintillants.
+function useNebulaTexture() {
+  return useMemo(() => {
+    const canvas = document.createElement('canvas');
+    canvas.width = 1024;
+    canvas.height = 512;
+    const ctx = canvas.getContext('2d');
+
+    const bg = ctx.createLinearGradient(0, 0, 0, canvas.height);
+    bg.addColorStop(0, '#05030f');
+    bg.addColorStop(0.5, '#0b0620');
+    bg.addColorStop(1, '#05030f');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    const blobColors = ['#4c1d95', '#1e3a8a', '#7e22ce', '#0e7490', '#831843'];
+    for (let i = 0; i < 26; i++) {
+      const x = Math.random() * canvas.width;
+      const y = Math.random() * canvas.height;
+      const r = 60 + Math.random() * 160;
+      const color = blobColors[Math.floor(Math.random() * blobColors.length)];
+      const grad = ctx.createRadialGradient(x, y, 0, x, y, r);
+      grad.addColorStop(0, color + '55');
+      grad.addColorStop(1, color + '00');
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // Semis d'étoiles fines directement dans la texture, en complément de <Stars/>
+    for (let i = 0; i < 500; i++) {
+      const x = Math.random() * canvas.width;
+      const y = Math.random() * canvas.height;
+      const s = Math.random() * 1.4;
+      ctx.fillStyle = `rgba(255,255,255,${0.3 + Math.random() * 0.6})`;
+      ctx.fillRect(x, y, s, s);
+    }
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.ClampToEdgeWrapping;
+    return texture;
+  }, []);
+}
+
+const NebulaSky = () => {
+  const texture = useNebulaTexture();
+  return (
+    <mesh>
+      <sphereGeometry args={[90, 32, 32]} />
+      <meshBasicMaterial map={texture} side={THREE.BackSide} fog={false} />
+    </mesh>
   );
 };
 
@@ -402,8 +599,14 @@ const CameraFocusRig = ({ focusFlag, onSettled }) => {
 // coordonnées 3D via drei/Html, donc reste "collé" au bon endroit du globe).
 const CountryZoomLabel = ({ flag }) => {
   if (!flag) return null;
+  // On flotte le label légèrement au-dessus du sol (le long de la normale à
+  // la sphère). Sans ce décalage, l'ancre est exactement sur la surface du
+  // pays et le raycast d'occlusion de <Html> se cognait contre le maillage
+  // du pays lui-même à chaque frame, ce qui gardait le label invisible en
+  // permanence — d'où le "on ne voit jamais le nom sur le globe".
+  const labelPos = flag.position.clone().add(flag.position.clone().normalize().multiplyScalar(0.4));
   return (
-    <Html position={flag.position} center distanceFactor={6} zIndexRange={[5, 0]} occlude>
+    <Html position={labelPos} center distanceFactor={6} zIndexRange={[5, 0]}>
       <div
         key={flag.country}
         style={{
@@ -447,9 +650,9 @@ const RatingStars = ({ value = 0, onChange, size = 18 }) => (
 );
 
 
-const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onLocationChange, onPlantFlag, visitedFlags, cameraLocked }) => {
+const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, visitedFlags, cameraLocked }) => {
   const playerRef = useRef();
-  const { camera } = useThree();
+  const { camera, gl } = useThree();
   
   const legL = useRef();
   const legR = useRef();
@@ -461,55 +664,190 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
   const playerPos = useRef(new THREE.Vector3(0, 5.12, 0));
   const playerDir = useRef(new THREE.Vector3(0, 0, 1));
   const keys = useRef({ z: false, q: false, s: false, d: false, space: false });
+  // Distance de la caméra par rapport au joueur, ajustable à la molette
+  // (remplace OrbitControls, qui entrait en conflit avec la caméra suiveuse
+  // et faisait revenir le zoom à sa valeur par défaut à chaque frame).
+  const zoomFactor = useRef(1);
+  const cameraLockedRef = useRef(cameraLocked);
+  useEffect(() => { cameraLockedRef.current = cameraLocked; }, [cameraLocked]);
+
   const [isOnWater, setIsOnWater] = useState(false);
   const [showFlagInHand, setShowFlagInHand] = useState(false);
-  const [transitionProgress, setTransitionProgress] = useState(0);
+  const [transitionProgress, setTransitionProgress] = useState(1);
   
   const isPlacingFlag = useRef(false);
   const plantAnimTime = useRef(0);
   const currentCountryRef = useRef(null);
   const prevWaterState = useRef(false);
-  const transitionStartTime = useRef(0);
+  const transitionStartTime = useRef(-10);
   const pendingWaterState = useRef(null);
   const pendingSince = useRef(0);
   const WATER_STATE_DEBOUNCE = 0.22;
+  const walkAnim = useRef({ bob: 0, lean: 0, tilt: 0 });
+
+  // Pool de particules réutilisées pour l'éclaboussure terre/eau (quasi gratuit
+  // en perf : pas de création/destruction de meshes en continu).
+  const SPLASH_COUNT = 14;
+  const splashMeshes = useRef([]);
+  const splashData = useRef(
+    Array.from({ length: SPLASH_COUNT }, () => ({
+      life: 999, maxLife: 1, vel: new THREE.Vector3(), pos: new THREE.Vector3(),
+    }))
+  );
+
+  const spawnSplash = (origin, normal) => {
+    let helper = new THREE.Vector3(0, 1, 0);
+    if (Math.abs(normal.dot(helper)) > 0.9) helper = new THREE.Vector3(1, 0, 0);
+    const t1 = new THREE.Vector3().crossVectors(normal, helper).normalize();
+    const t2 = new THREE.Vector3().crossVectors(normal, t1).normalize();
+    splashData.current.forEach((p) => {
+      const angle = Math.random() * Math.PI * 2;
+      const outward = 0.02 + Math.random() * 0.035;
+      const up = 0.03 + Math.random() * 0.035;
+      p.vel
+        .copy(t1).multiplyScalar(Math.cos(angle) * outward)
+        .addScaledVector(t2, Math.sin(angle) * outward)
+        .addScaledVector(normal, up);
+      p.pos.copy(origin);
+      p.life = 0;
+      p.maxLife = 0.35 + Math.random() * 0.25;
+    });
+  };
+
+  // Tête (pour l'animation "idle" de regard autour de soi)
+  const headRef = useRef();
+  const idleTimer = useRef(0);
+  const idleBlend = useRef(0);
+  const IDLE_LOOK_AFTER = 4;     // secondes avant que le perso regarde autour de lui
+  const SCREENSAVER_AFTER = 22;  // secondes avant la rotation caméra "écran de veille"
+
+  // Sillage derrière la chaloupe (mêmes particules que l'éclaboussure, mais
+  // émises en continu pendant l'avancée sur l'eau plutôt qu'en une seule fois).
+  const WAKE_COUNT = 10;
+  const wakeMeshes = useRef([]);
+  const wakeData = useRef(
+    Array.from({ length: WAKE_COUNT }, () => ({ life: 999, maxLife: 1, vel: new THREE.Vector3(), pos: new THREE.Vector3() }))
+  );
+  const wakeIndex = useRef(0);
+  const wakeSpawnTimer = useRef(0);
+  const spawnWake = (origin, dir) => {
+    const i = wakeIndex.current;
+    wakeIndex.current = (i + 1) % WAKE_COUNT;
+    const p = wakeData.current[i];
+    p.pos.copy(origin);
+    p.vel.copy(dir).multiplyScalar(-0.008);
+    p.life = 0;
+    p.maxLife = 0.7 + Math.random() * 0.3;
+  };
+
+  // Poussière sous les pieds en marchant sur terre.
+  const DUST_COUNT = 10;
+  const dustMeshes = useRef([]);
+  const dustData = useRef(
+    Array.from({ length: DUST_COUNT }, () => ({ life: 999, maxLife: 1, vel: new THREE.Vector3(), pos: new THREE.Vector3() }))
+  );
+  const dustIndex = useRef(0);
+  const dustSpawnTimer = useRef(0);
+  const spawnDust = (origin, normal) => {
+    const i = dustIndex.current;
+    dustIndex.current = (i + 1) % DUST_COUNT;
+    const p = dustData.current[i];
+    p.pos.copy(origin).addScaledVector(normal, 0.01);
+    p.vel.copy(normal).multiplyScalar(0.004);
+    p.life = 0;
+    p.maxLife = 0.45 + Math.random() * 0.2;
+  };
+
+  // Confettis à la plantation d'un drapeau.
+  const CONFETTI_COUNT = 18;
+  const CONFETTI_COLORS = ['#F87171', '#FBBF24', '#34D399', '#60A5FA', '#A78BFA', '#F472B6'];
+  const confettiMeshes = useRef([]);
+  const confettiData = useRef(
+    Array.from({ length: CONFETTI_COUNT }, () => ({
+      life: 999, maxLife: 1, vel: new THREE.Vector3(), pos: new THREE.Vector3(),
+      normal: new THREE.Vector3(), spin: new THREE.Vector3(), color: new THREE.Color(),
+    }))
+  );
+  const spawnConfetti = (origin, normal) => {
+    let helper = new THREE.Vector3(0, 1, 0);
+    if (Math.abs(normal.dot(helper)) > 0.9) helper = new THREE.Vector3(1, 0, 0);
+    const t1 = new THREE.Vector3().crossVectors(normal, helper).normalize();
+    const t2 = new THREE.Vector3().crossVectors(normal, t1).normalize();
+    confettiData.current.forEach((p) => {
+      const angle = Math.random() * Math.PI * 2;
+      const outward = 0.02 + Math.random() * 0.05;
+      const up = 0.07 + Math.random() * 0.08;
+      p.vel
+        .copy(t1).multiplyScalar(Math.cos(angle) * outward)
+        .addScaledVector(t2, Math.sin(angle) * outward)
+        .addScaledVector(normal, up);
+      p.pos.copy(origin).addScaledVector(normal, 0.06);
+      p.normal.copy(normal);
+      p.spin.set((Math.random() - 0.5) * 12, (Math.random() - 0.5) * 12, (Math.random() - 0.5) * 12);
+      p.color.set(CONFETTI_COLORS[Math.floor(Math.random() * CONFETTI_COLORS.length)]);
+      p.life = 0;
+      p.maxLife = 0.8 + Math.random() * 0.5;
+    });
+  };
 
   useEffect(() => {
-    if (controlMode !== 'zqsd') return;
-
     const handleKeyDown = (e) => {
       const k = e.key.toLowerCase();
-      if (k === 'z') keys.current.z = true;
-      if (k === 'q') keys.current.q = true;
-      if (k === 's') keys.current.s = true;
-      if (k === 'd') keys.current.d = true;
+      if (k === 'z' || e.key === 'ArrowUp') keys.current.z = true;
+      if (k === 'q' || e.key === 'ArrowLeft') keys.current.q = true;
+      if (k === 's' || e.key === 'ArrowDown') keys.current.s = true;
+      if (k === 'd' || e.key === 'ArrowRight') keys.current.d = true;
       if (e.code === 'Space') keys.current.space = true;
     };
 
     const handleKeyUp = (e) => {
       const k = e.key.toLowerCase();
-      if (k === 'z') keys.current.z = false;
-      if (k === 'q') keys.current.q = false;
-      if (k === 's') keys.current.s = false;
-      if (k === 'd') keys.current.d = false;
+      if (k === 'z' || e.key === 'ArrowUp') keys.current.z = false;
+      if (k === 'q' || e.key === 'ArrowLeft') keys.current.q = false;
+      if (k === 's' || e.key === 'ArrowDown') keys.current.s = false;
+      if (k === 'd' || e.key === 'ArrowRight') keys.current.d = false;
       if (e.code === 'Space') keys.current.space = false;
+    };
+
+    const handleWheel = (e) => {
+      if (cameraLockedRef.current) return; // pas de zoom manuel pendant le zoom sur un pays
+      e.preventDefault();
+      zoomFactor.current = THREE.MathUtils.clamp(zoomFactor.current + e.deltaY * 0.001, 0.5, 2.2);
     };
 
     window.addEventListener('keydown', handleKeyDown);
     window.addEventListener('keyup', handleKeyUp);
+    const canvasEl = gl.domElement;
+    canvasEl.addEventListener('wheel', handleWheel, { passive: false });
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
       window.removeEventListener('keyup', handleKeyUp);
+      canvasEl.removeEventListener('wheel', handleWheel);
     };
-  }, [controlMode]);
+  }, [gl]);
 
-  useFrame(({ clock }) => {
+  useFrame(({ clock }, delta) => {
     if (!playerRef.current) return;
+    if (cameraLocked) return; // le joueur est figé pendant qu'on consulte un pays
 
     let isMoving = false;
     const radius = 5.12;
 
-    if (controlMode === 'zqsd') {
+    // Minuteur d'inactivité : recalculé en tout début de frame car il ne
+    // dépend que de l'état courant des touches, pas du reste du mouvement.
+    const isWalkingKey = keys.current.z || keys.current.s;
+    const isTurningKey = !isWalkingKey && (keys.current.q || keys.current.d);
+    if (isWalkingKey || isTurningKey || isPlacingFlag.current) {
+      idleTimer.current = 0;
+    } else {
+      idleTimer.current += delta;
+    }
+    idleBlend.current = THREE.MathUtils.lerp(idleBlend.current, idleTimer.current > IDLE_LOOK_AFTER ? 1 : 0, 0.04);
+    if (headRef.current) {
+      headRef.current.rotation.y = Math.sin(clock.getElapsedTime() * 0.4) * 0.4 * idleBlend.current;
+    }
+
+    {
       const moveSpeed = 0.035;
       const rotateSpeed = 0.04;
 
@@ -533,6 +871,7 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
         if (elapsed > 0.5 && showFlagInHand) {
           setShowFlagInHand(false);
           if (onPlantFlag) onPlantFlag(playerPos.current.clone());
+          spawnConfetti(playerPos.current, playerPos.current.clone().normalize());
         }
 
         if (elapsed > 1.0) {
@@ -591,6 +930,7 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
           prevWaterState.current = rawWaterState;
           transitionStartTime.current = nowT;
           pendingWaterState.current = null;
+          spawnSplash(playerPos.current, upNormal);
         }
       } else {
         pendingWaterState.current = null;
@@ -599,7 +939,7 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
 
       const tTrans = nowT - transitionStartTime.current;
       const progress = Math.min(1, tTrans / 0.6);
-      setTransitionProgress(waterState ? progress : (1 - progress));
+      setTransitionProgress(progress);
 
       setIsOnWater(waterState);
       if (onWaterChange) onWaterChange(waterState);
@@ -607,29 +947,30 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
 
       const backwardDir = playerDir.current.clone().negate();
       const idealCameraPos = playerPos.current.clone()
-        .add(backwardDir.multiplyScalar(2.8))
-        .add(upNormal.multiplyScalar(5.0));
+        .add(backwardDir.multiplyScalar(2.8 * zoomFactor.current))
+        .add(upNormal.multiplyScalar(5.0 * zoomFactor.current));
 
       if (!cameraLocked) {
-        camera.position.lerp(idealCameraPos, 0.15);
-        camera.up.copy(upNormal);
-        camera.lookAt(playerPos.current);
-      }
-
-    } else if (controlMode === 'click' && targetPosition) {
-      const currentPos = playerRef.current.position;
-      const adjustedTarget = targetPosition.clone().normalize().multiplyScalar(radius);
-      const distance = currentPos.distanceTo(adjustedTarget);
-      isMoving = distance > 0.02;
-
-      if (isMoving) {
-        currentPos.lerp(adjustedTarget, 0.05);
-        currentPos.normalize().multiplyScalar(radius); 
-        const upNormal = currentPos.clone().normalize();
-        const lookAtMatrix = new THREE.Matrix4();
-        lookAtMatrix.lookAt(currentPos, adjustedTarget, upNormal);
-        playerRef.current.quaternion.setFromRotationMatrix(lookAtMatrix);
-        playerPos.current.copy(currentPos);
+        if (idleTimer.current > SCREENSAVER_AFTER) {
+          // Personne n'a touché aux commandes depuis un moment : la caméra
+          // se met à orbiter doucement autour du globe, façon écran de veille.
+          const orbitT = clock.getElapsedTime() * 0.06;
+          const orbitDist = 13;
+          const orbitPos = new THREE.Vector3(
+            Math.cos(orbitT) * orbitDist,
+            3 + Math.sin(orbitT * 0.4) * 2,
+            Math.sin(orbitT) * orbitDist
+          );
+          camera.position.lerp(orbitPos, 0.02);
+          camera.up.lerp(new THREE.Vector3(0, 1, 0), 0.02);
+          camera.lookAt(0, 0, 0);
+        } else {
+          camera.position.lerp(idealCameraPos, 0.15);
+          camera.up.copy(upNormal);
+          const camLookMatrix = new THREE.Matrix4().lookAt(camera.position, playerPos.current, upNormal);
+          const camTargetQuat = new THREE.Quaternion().setFromRotationMatrix(camLookMatrix);
+          camera.quaternion.slerp(camTargetQuat, 0.18);
+        }
       }
     }
 
@@ -637,12 +978,49 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
       const t = clock.getElapsedTime() * 12; 
       const angle = 0.5; 
       if (!isOnWater) {
-        if (legL.current) legL.current.rotation.x = Math.sin(t) * angle;
-        if (legR.current) legR.current.rotation.x = Math.sin(t + Math.PI) * angle;
-        if (armL.current) armL.current.rotation.x = Math.sin(t + Math.PI) * angle;
-        if (armR.current) armR.current.rotation.x = Math.sin(t) * angle;
+        if (isWalkingKey) {
+          // Marche avant/arrière : foulée complète, bras et jambes en opposition.
+          if (legL.current) legL.current.rotation.x = Math.sin(t) * angle;
+          if (legR.current) legR.current.rotation.x = Math.sin(t + Math.PI) * angle;
+          if (armL.current) armL.current.rotation.x = Math.sin(t + Math.PI) * angle;
+          if (armR.current) armR.current.rotation.x = Math.sin(t) * angle;
+          walkAnim.current.bob = Math.abs(Math.sin(t)) * 0.018;
+          walkAnim.current.lean = THREE.MathUtils.lerp(walkAnim.current.lean, -0.07, 0.15);
+          walkAnim.current.tilt = THREE.MathUtils.lerp(walkAnim.current.tilt, 0, 0.15);
+
+          // Poussière sous les pieds, cadencée sur la foulée (un nuage à
+          // chaque appui au sol, donc deux fois par cycle de jambe).
+          dustSpawnTimer.current -= delta;
+          if (dustSpawnTimer.current <= 0) {
+            dustSpawnTimer.current = 0.16;
+            spawnDust(playerPos.current, playerPos.current.clone().normalize());
+          }
+        } else if (isTurningKey) {
+          // Rotation sur soi (Q/D seuls, sans avancer) : un pas chassé sur
+          // place plutôt qu'une vraie foulée — jambes qui se soulèvent
+          // légèrement en alternance, bras presque immobiles, et un léger
+          // dévers du buste dans le sens du pivot pour vendre le mouvement.
+          const tt = clock.getElapsedTime() * 8;
+          const turnSign = keys.current.q ? 1 : -1;
+          if (legL.current) legL.current.rotation.x = Math.sin(tt) * 0.22;
+          if (legR.current) legR.current.rotation.x = Math.sin(tt + Math.PI) * 0.22;
+          if (armL.current) armL.current.rotation.x = THREE.MathUtils.lerp(armL.current.rotation.x, 0, 0.2);
+          if (armR.current) armR.current.rotation.x = THREE.MathUtils.lerp(armR.current.rotation.x, 0, 0.2);
+          walkAnim.current.bob = Math.abs(Math.sin(tt)) * 0.01;
+          walkAnim.current.lean = THREE.MathUtils.lerp(walkAnim.current.lean, 0, 0.15);
+          walkAnim.current.tilt = THREE.MathUtils.lerp(walkAnim.current.tilt, turnSign * 0.09, 0.15);
+        }
       } else {
         if (oarRef.current) oarRef.current.rotation.z = Math.sin(t) * 0.4;
+
+        // Sillage derrière la chaloupe, uniquement en avançant/reculant sur l'eau.
+        if (isWalkingKey) {
+          wakeSpawnTimer.current -= delta;
+          if (wakeSpawnTimer.current <= 0) {
+            wakeSpawnTimer.current = 0.09;
+            spawnWake(playerPos.current, playerDir.current);
+          }
+        }
       }
     } else if (!isPlacingFlag.current) {
       if (legL.current) {
@@ -654,22 +1032,171 @@ const Player = ({ targetPosition, controlMode, countriesData, onWaterChange, onL
       if (oarRef.current) {
         oarRef.current.rotation.z = THREE.MathUtils.lerp(oarRef.current.rotation.z, 0, 0.1);
       }
+      walkAnim.current.bob = THREE.MathUtils.lerp(walkAnim.current.bob, 0, 0.15);
+      walkAnim.current.lean = THREE.MathUtils.lerp(walkAnim.current.lean, 0, 0.15);
+      walkAnim.current.tilt = THREE.MathUtils.lerp(walkAnim.current.tilt, 0, 0.15);
     }
+
+    // Anime le pool de particules d'éclaboussure (mouvement + amortissement + fondu).
+    splashData.current.forEach((p, i) => {
+      const mesh = splashMeshes.current[i];
+      if (!mesh) return;
+      if (p.life < p.maxLife) {
+        p.life += delta;
+        p.pos.addScaledVector(p.vel, delta * 60);
+        p.vel.multiplyScalar(0.9);
+        const lifeT = p.life / p.maxLife;
+        mesh.visible = true;
+        mesh.position.copy(p.pos);
+        mesh.scale.setScalar(THREE.MathUtils.lerp(1, 0.15, lifeT));
+        if (mesh.material) mesh.material.opacity = 1 - lifeT;
+      } else if (mesh.visible) {
+        mesh.visible = false;
+      }
+    });
+
+    // Sillage : s'étire et s'estompe derrière la chaloupe.
+    wakeData.current.forEach((p, i) => {
+      const mesh = wakeMeshes.current[i];
+      if (!mesh) return;
+      if (p.life < p.maxLife) {
+        p.life += delta;
+        p.pos.addScaledVector(p.vel, delta * 60);
+        const lifeT = p.life / p.maxLife;
+        mesh.visible = true;
+        mesh.position.copy(p.pos);
+        mesh.scale.setScalar(THREE.MathUtils.lerp(0.6, 1.8, lifeT));
+        if (mesh.material) mesh.material.opacity = 0.5 * (1 - lifeT);
+      } else if (mesh.visible) {
+        mesh.visible = false;
+      }
+    });
+
+    // Poussière : petit nuage qui monte doucement puis se dissipe.
+    dustData.current.forEach((p, i) => {
+      const mesh = dustMeshes.current[i];
+      if (!mesh) return;
+      if (p.life < p.maxLife) {
+        p.life += delta;
+        p.pos.addScaledVector(p.vel, delta * 60);
+        const lifeT = p.life / p.maxLife;
+        mesh.visible = true;
+        mesh.position.copy(p.pos);
+        mesh.scale.setScalar(THREE.MathUtils.lerp(0.5, 1.3, lifeT));
+        if (mesh.material) mesh.material.opacity = 0.45 * (1 - lifeT);
+      } else if (mesh.visible) {
+        mesh.visible = false;
+      }
+    });
+
+    // Confettis : gravité légère + rotation, puis fondu.
+    confettiData.current.forEach((p, i) => {
+      const mesh = confettiMeshes.current[i];
+      if (!mesh) return;
+      if (p.life < p.maxLife) {
+        p.life += delta;
+        p.vel.addScaledVector(p.normal, -0.0025); // gravité vers le sol du pays
+        p.pos.addScaledVector(p.vel, delta * 60);
+        const lifeT = p.life / p.maxLife;
+        mesh.visible = true;
+        mesh.position.copy(p.pos);
+        mesh.rotation.x += p.spin.x * delta;
+        mesh.rotation.y += p.spin.y * delta;
+        mesh.rotation.z += p.spin.z * delta;
+        if (mesh.material) {
+          mesh.material.opacity = 1 - lifeT;
+          if (lifeT < delta * 2) mesh.material.color.copy(p.color); // vient de spawner : fixe sa couleur
+        }
+      } else if (mesh.visible) {
+        mesh.visible = false;
+      }
+    });
   });
 
   return (
-    <group ref={playerRef} position={[0, 5.12, 0]}>
-      {isOnWater ? (
-        <BoatWithRider oarRef={oarRef} transitionProgress={transitionProgress} />
-      ) : (
-        <Stickman legL={legL} legR={legR} armL={armL} armR={armR} bodyRef={bodyRef} showFlagInHand={showFlagInHand} />
-      )}
-    </group>
+    <>
+      <group ref={playerRef} position={[0, 5.12, 0]}>
+        {isOnWater ? (
+          <BoatWithRider oarRef={oarRef} transitionProgress={transitionProgress} />
+        ) : (
+          <Stickman
+            legL={legL}
+            legR={legR}
+            armL={armL}
+            armR={armR}
+            bodyRef={bodyRef}
+            headRef={headRef}
+            showFlagInHand={showFlagInHand}
+            transitionProgress={transitionProgress}
+            walkBob={walkAnim.current.bob}
+            walkLean={walkAnim.current.lean}
+            walkTilt={walkAnim.current.tilt}
+          />
+        )}
+      </group>
+      <SplashParticles meshesRef={splashMeshes} count={SPLASH_COUNT} />
+      <WakeParticles meshesRef={wakeMeshes} count={WAKE_COUNT} />
+      <DustParticles meshesRef={dustMeshes} count={DUST_COUNT} />
+      <ConfettiParticles meshesRef={confettiMeshes} count={CONFETTI_COUNT} />
+    </>
   );
 };
 
+// Rendu du pool de particules d'éclaboussure : reste en coordonnées MONDE
+// (pas d'attache au joueur), sinon les particules hériteraient de sa
+// rotation et partiraient dans le mauvais sens.
+const SplashParticles = ({ meshesRef, count }) => (
+  <group>
+    {Array.from({ length: count }).map((_, i) => (
+      <mesh key={i} ref={(el) => { if (el) meshesRef.current[i] = el; }} visible={false}>
+        <sphereGeometry args={[0.03, 6, 6]} />
+        <meshBasicMaterial color="#BFDBFE" transparent opacity={0} depthWrite={false} />
+      </mesh>
+    ))}
+  </group>
+);
+
+// Sillage de la chaloupe : petites taches claires, plus douces et plus
+// étirées que l'éclaboussure (voir la boucle d'animation dans Player).
+const WakeParticles = ({ meshesRef, count }) => (
+  <group>
+    {Array.from({ length: count }).map((_, i) => (
+      <mesh key={i} ref={(el) => { if (el) meshesRef.current[i] = el; }} visible={false}>
+        <circleGeometry args={[0.05, 8]} />
+        <meshBasicMaterial color="#E0F2FE" transparent opacity={0} depthWrite={false} side={THREE.DoubleSide} />
+      </mesh>
+    ))}
+  </group>
+);
+
+// Poussière sous les pieds sur terre : petites sphères ternes, plus grosses
+// et plus lentes que l'éclaboussure d'eau.
+const DustParticles = ({ meshesRef, count }) => (
+  <group>
+    {Array.from({ length: count }).map((_, i) => (
+      <mesh key={i} ref={(el) => { if (el) meshesRef.current[i] = el; }} visible={false}>
+        <sphereGeometry args={[0.025, 6, 6]} />
+        <meshBasicMaterial color="#C7B299" transparent opacity={0} depthWrite={false} />
+      </mesh>
+    ))}
+  </group>
+);
+
+// Confettis à la plantation d'un drapeau : petits carrés colorés qui
+// culbutent (rotation appliquée dans la boucle d'animation de Player).
+const ConfettiParticles = ({ meshesRef, count }) => (
+  <group>
+    {Array.from({ length: count }).map((_, i) => (
+      <mesh key={i} ref={(el) => { if (el) meshesRef.current[i] = el; }} visible={false}>
+        <planeGeometry args={[0.035, 0.035]} />
+        <meshBasicMaterial color="#F87171" transparent opacity={0} depthWrite={false} side={THREE.DoubleSide} />
+      </mesh>
+    ))}
+  </group>
+);
+
 // 6. Un Pays Individuel
-const CountryMesh = ({ feature, onHover, onClick, controlMode, activeCountry }) => {
+const CountryMesh = ({ feature, onHover, onClick, activeCountry }) => {
   const [hovered, setHovered] = useState(false);
 
   const geometries = useMemo(() => {
@@ -688,13 +1215,25 @@ const CountryMesh = ({ feature, onHover, onClick, controlMode, activeCountry }) 
         else shape.lineTo(lon, lat);
       });
 
-      const extrudeSettings = { depth: 0.08, bevelEnabled: false };
-      const meshGeom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-      projectGeometryToSphere(meshGeom, 5);
+      // On garde la même hauteur de "plateau" visible (sommet à 5.08, comme
+      // avant), mais on prolonge bien plus profondément la base du pays
+      // (jusqu'à 4.8, sous la surface de l'océan à 4.85). Avant, la base
+      // s'arrêtait à 5.0, laissant un vide de 0.15 unité entre le dessous du
+      // pays et la mer — visible sous certains angles de caméra comme un
+      // effet de "terre qui flotte". Maintenant les "racines" du pays
+      // plongent dans l'océan, donc plus aucun vide n'est visible.
+      // Sommet du plateau à 4.95 (seulement 0.10 au-dessus de l'océan à 4.85,
+      // au lieu de 0.23 avant — moins de "marche" visible entre mer et
+      // terre), racines toujours submergées à 4.75 (0.10 sous l'océan) pour
+      // qu'aucun vide ne soit visible sous le pays.
+      const extrudeSettings = { depth: 0.2, bevelEnabled: false };
+      let meshGeom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+      meshGeom = subdivideFlatGeometry(meshGeom, 2.2);
+      projectGeometryToSphere(meshGeom, 4.75);
 
       const borderPoints = [];
       outerRing.forEach(([lon, lat]) => {
-        const r = 5.082; 
+        const r = 4.952; 
         const phi = (90 - lat) * (Math.PI / 180);
         const theta = (lon + 180) * (Math.PI / 180);
         const x = -(r * Math.sin(phi) * Math.cos(theta));
@@ -715,18 +1254,9 @@ const CountryMesh = ({ feature, onHover, onClick, controlMode, activeCountry }) 
 
   return (
     <group
-      onPointerEnter={(e) => { 
-        if (controlMode === 'click') { e.stopPropagation(); setHovered(true); onHover(countryName); }
-      }}
-      onPointerLeave={(e) => { 
-        if (controlMode === 'click') { e.stopPropagation(); setHovered(false); onHover(null); }
-      }}
-      onClick={(e) => { 
-        if (controlMode === 'click') {
-          e.stopPropagation(); 
-          onClick(countryName, e.point); 
-        }
-      }}
+      onPointerEnter={(e) => { e.stopPropagation(); setHovered(true); onHover(countryName); }}
+      onPointerLeave={(e) => { e.stopPropagation(); setHovered(false); onHover(null); }}
+      onClick={(e) => { e.stopPropagation(); onClick(countryName); }}
     >
       {geometries.map((part, idx) => (
         <group key={idx}>
@@ -743,7 +1273,7 @@ const CountryMesh = ({ feature, onHover, onClick, controlMode, activeCountry }) 
 };
 
 // 7. Globe Combiné
-const GlobeWithCountries = ({ onHoverCountry, onClickCountry, controlMode, setCountriesData, activeCountry }) => {
+const GlobeWithCountries = ({ onHoverCountry, onClickCountry, setCountriesData, activeCountry }) => {
   const [countries, setCountries] = useState([]);
 
   useEffect(() => {
@@ -759,14 +1289,16 @@ const GlobeWithCountries = ({ onHoverCountry, onClickCountry, controlMode, setCo
   return (
     <group>
       <mesh receiveShadow castShadow>
-        <icosahedronGeometry args={[4.95, 12]} />
+        <icosahedronGeometry args={[4.85, 12]} />
         {/* MeshDistortMaterial anime une déformation subtile en continu : donne
-            une impression d'océan "vivant" sans coût de simulation physique. */}
+            une impression d'océan "vivant" sans coût de simulation physique.
+            roughness/metalness ajustés pour des reflets francs qui accrochent
+            le bloom (voir <Bloom/> plus bas) — effet d'eau scintillante. */}
         <MeshDistortMaterial
           color="#1E40AF"
           flatShading={true}
-          roughness={0.75}
-          metalness={0.1}
+          roughness={0.42}
+          metalness={0.2}
           distort={0.035}
           speed={0.8}
         />
@@ -778,7 +1310,6 @@ const GlobeWithCountries = ({ onHoverCountry, onClickCountry, controlMode, setCo
           feature={feature} 
           onHover={onHoverCountry}
           onClick={onClickCountry}
-          controlMode={controlMode}
           activeCountry={activeCountry}
         />
       ))}
@@ -790,8 +1321,6 @@ const GlobeWithCountries = ({ onHoverCountry, onClickCountry, controlMode, setCo
 const TravelPortfolioScene = () => {
   const [hoveredCountry, setHoveredCountry] = useState(null);
   const [selectedCountry, setSelectedCountry] = useState(null);
-  const [targetPosition, setTargetPosition] = useState(null);
-  const [controlMode, setControlMode] = useState('click');
   const [countriesData, setCountriesData] = useState([]);
   const [isOnWater, setIsOnWater] = useState(false);
   
@@ -888,24 +1417,8 @@ const TravelPortfolioScene = () => {
   return (
     <div style={{ width: '100vw', height: '100vh', background: '#090d16', overflow: 'hidden', position: 'relative' }}>
       
-      {/* Boutons de Contrôle */}
-      <div style={{ position: 'absolute', top: 30, right: 30, zIndex: 10, display: 'flex', gap: '10px', background: 'rgba(255,255,255,0.1)', padding: '6px', borderRadius: '10px', backdropFilter: 'blur(10px)' }}>
-        <button 
-          onClick={() => setControlMode('click')}
-          style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', background: controlMode === 'click' ? '#4ADE80' : 'transparent', color: controlMode === 'click' ? '#000' : '#fff', fontWeight: 'bold', cursor: 'pointer', transition: '0.2s' }}
-        >
-          Mode Clic 🖱️
-        </button>
-        <button 
-          onClick={() => setControlMode('zqsd')}
-          style={{ padding: '8px 16px', borderRadius: '6px', border: 'none', background: controlMode === 'zqsd' ? '#4ADE80' : 'transparent', color: controlMode === 'zqsd' ? '#000' : '#fff', fontWeight: 'bold', cursor: 'pointer', transition: '0.2s' }}
-        >
-          Mode ZQSD ⌨️
-        </button>
-      </div>
-
       {/* Panneau latéral des pays visités */}
-      <div style={{ position: 'absolute', top: 110, right: 30, zIndex: 10, width: '220px', background: 'rgba(15, 23, 42, 0.85)', border: '1px solid rgba(255,255,255,0.15)', padding: '15px', borderRadius: '12px', backdropFilter: 'blur(10px)', color: '#fff' }}>
+      <div style={{ position: 'absolute', top: 30, right: 30, zIndex: 10, width: '220px', background: 'rgba(15, 23, 42, 0.85)', border: '1px solid rgba(255,255,255,0.15)', padding: '15px', borderRadius: '12px', backdropFilter: 'blur(10px)', color: '#fff' }}>
         <h3 style={{ margin: '0 0 10px 0', fontSize: '15px', color: '#4ADE80' }}>Pays visités</h3>
         {visitedFlags.length === 0 ? (
           <p style={{ margin: 0, fontSize: '12px', opacity: 0.6 }}>Aucun drapeau planté.</p>
@@ -940,22 +1453,17 @@ const TravelPortfolioScene = () => {
       </div>
 
       <Canvas shadows camera={{ position: [0, 0, 14], fov: 45 }}>
-        <ambientLight intensity={0.5} />
-        <directionalLight position={[10, 10, 5]} intensity={1.5} castShadow />
-        <directionalLight position={[-10, -10, -5]} intensity={0.3} color="#90b0d0" />
+        <ambientLight intensity={0.28} />
+        <RotatingSun />
+        <directionalLight position={[-10, -10, -5]} intensity={0.12} color="#90b0d0" />
 
-        <Stars radius={100} depth={50} count={3000} factor={4} fade />
+        <NebulaSky />
+        <Stars radius={85} depth={50} count={3000} factor={4} fade />
         
         <Player 
-          targetPosition={targetPosition} 
-          controlMode={controlMode} 
           countriesData={countriesData}
           onWaterChange={setIsOnWater}
-          onLocationChange={(countryName) => {
-            if (controlMode === 'zqsd') {
-              setSelectedCountry(countryName);
-            }
-          }}
+          onLocationChange={(countryName) => setSelectedCountry(countryName)}
           onPlantFlag={handlePlantFlag}
           visitedFlags={visitedFlags}
           cameraLocked={cameraLocked}
@@ -963,13 +1471,11 @@ const TravelPortfolioScene = () => {
 
         <GlobeWithCountries 
           onHoverCountry={setHoveredCountry} 
-          onClickCountry={(name, point) => {
-            if (controlMode === 'click') {
-              setSelectedCountry(name);
-              setTargetPosition(point);
-            }
+          onClickCountry={(name) => {
+            // Cliquer sur un pays déjà visité ouvre directement sa fiche.
+            // Le déplacement se fait uniquement au clavier désormais.
+            if (visitedFlags.some(f => f.country === name)) openCountryNote(name);
           }} 
-          controlMode={controlMode}
           setCountriesData={setCountriesData}
           activeCountry={selectedCountry}
         />
@@ -985,10 +1491,14 @@ const TravelPortfolioScene = () => {
 
         <CameraFocusRig focusFlag={activePopupFlag} onSettled={() => setReturningCamera(false)} />
         <CountryZoomLabel flag={activePopupFlag} />
-        
-        {!cameraLocked && (
-          <OrbitControls enablePan={false} enableRotate={controlMode === 'click'} minDistance={6} maxDistance={20} />
-        )}
+        <EffectComposer>
+          <Bloom
+            luminanceThreshold={0.35}
+            luminanceSmoothing={0.9}
+            intensity={0.9}
+            mipmapBlur
+          />
+        </EffectComposer>
       </Canvas>
 
       {/* Animations CSS (label géant sur le globe + glissement du panneau) */}
@@ -1128,9 +1638,7 @@ const TravelPortfolioScene = () => {
       <div style={{ position: 'absolute', top: 30, left: 30, color: 'white', fontFamily: 'system-ui, sans-serif', pointerEvents: 'none' }}>
         <h1 style={{ margin: 0, fontSize: '28px', fontWeight: 'bold' }}>Globe Explorateur</h1>
         <p style={{ margin: '5px 0 0 0', opacity: 0.8 }}>
-          {controlMode === 'click' 
-            ? (hoveredCountry ? `📍 Survol : ${hoveredCountry}` : 'Cliquez sur un pays pour y voyager !')
-            : (isOnWater ? '🌊 En navigation (Chaloupe)' : `🚶‍♂️ Territoire : ${selectedCountry || 'Inconnu'} ${visitedFlags.some(f => f.country === selectedCountry) ? '(Drapeau déjà posé)' : '(Appuyez sur ESPACE pour planter un drapeau)'}`)}
+          {isOnWater ? '🌊 En navigation (Chaloupe)' : `🚶‍♂️ Territoire : ${selectedCountry || 'Inconnu'} ${visitedFlags.some(f => f.country === selectedCountry) ? '(Drapeau déjà posé)' : '(Appuyez sur ESPACE pour planter un drapeau)'}`}
         </p>
       </div>
     </div>
