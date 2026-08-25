@@ -100,6 +100,71 @@ async function idbSaveFlags(flags) {
   }
 }
 
+async function idbClearFlags() {
+  try {
+    const db = await idbOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).delete(IDB_KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    return true;
+  } catch (err) {
+    console.error('Erreur de réinitialisation :', err);
+    return false;
+  }
+}
+
+// --- Paramètres (touches, graphismes, son) -----------------------------
+// Stockés en localStorage plutôt qu'IndexedDB : c'est un tout petit objet
+// sans photo, donc pas de souci de quota, et l'accès est synchrone (plus
+// simple pour une valeur lue/écrite rarement).
+const SETTINGS_KEY = 'countries-been-settings';
+const DEFAULT_KEYBINDINGS = { forward: 'z', backward: 's', left: 'q', right: 'd', plant: ' ' };
+const DEFAULT_SETTINGS = {
+  keybindings: DEFAULT_KEYBINDINGS,
+  bloom: true,
+  shadows: true,
+  reduceMotion: false,
+  soundMaster: 0.7,
+  soundFootsteps: true,
+  soundOars: true,
+  soundFlag: true,
+};
+
+function loadSettings() {
+  try {
+    const raw = localStorage.getItem(SETTINGS_KEY);
+    if (!raw) return DEFAULT_SETTINGS;
+    const parsed = JSON.parse(raw);
+    // Fusionne avec les valeurs par défaut : si une future mise à jour ajoute
+    // un réglage, les anciennes sauvegardes ne cassent rien.
+    return {
+      ...DEFAULT_SETTINGS,
+      ...parsed,
+      keybindings: { ...DEFAULT_KEYBINDINGS, ...(parsed.keybindings || {}) },
+    };
+  } catch {
+    return DEFAULT_SETTINGS;
+  }
+}
+
+function saveSettings(settings) {
+  try {
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const KEY_LABELS = { ' ': 'ESPACE', 'arrowup': '↑', 'arrowdown': '↓', 'arrowleft': '←', 'arrowright': '→' };
+function formatKeyLabel(key) {
+  if (!key) return '?';
+  return KEY_LABELS[key.toLowerCase()] || key.toUpperCase();
+}
+
 function densifyRing(ring, maxStepDeg = 3) {
   if (!ring || ring.length < 2) return ring;
   const out = [];
@@ -712,7 +777,7 @@ const RatingStars = ({ value = 0, onChange, size = 18 }) => (
 );
 
 
-const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, visitedFlags, cameraLocked }) => {
+const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, visitedFlags, cameraLocked, keybindings, reduceMotion }) => {
   const playerRef = useRef();
   const { camera, gl } = useThree();
   
@@ -853,22 +918,23 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
   };
 
   useEffect(() => {
+    const kb = keybindings || DEFAULT_KEYBINDINGS;
     const handleKeyDown = (e) => {
       const k = e.key.toLowerCase();
-      if (k === 'z' || e.key === 'ArrowUp') keys.current.z = true;
-      if (k === 'q' || e.key === 'ArrowLeft') keys.current.q = true;
-      if (k === 's' || e.key === 'ArrowDown') keys.current.s = true;
-      if (k === 'd' || e.key === 'ArrowRight') keys.current.d = true;
-      if (e.code === 'Space') keys.current.space = true;
+      if (k === kb.forward || e.key === 'ArrowUp') keys.current.z = true;
+      if (k === kb.left || e.key === 'ArrowLeft') keys.current.q = true;
+      if (k === kb.backward || e.key === 'ArrowDown') keys.current.s = true;
+      if (k === kb.right || e.key === 'ArrowRight') keys.current.d = true;
+      if (k === kb.plant.toLowerCase() || e.code === 'Space') keys.current.space = true;
     };
 
     const handleKeyUp = (e) => {
       const k = e.key.toLowerCase();
-      if (k === 'z' || e.key === 'ArrowUp') keys.current.z = false;
-      if (k === 'q' || e.key === 'ArrowLeft') keys.current.q = false;
-      if (k === 's' || e.key === 'ArrowDown') keys.current.s = false;
-      if (k === 'd' || e.key === 'ArrowRight') keys.current.d = false;
-      if (e.code === 'Space') keys.current.space = false;
+      if (k === kb.forward || e.key === 'ArrowUp') keys.current.z = false;
+      if (k === kb.left || e.key === 'ArrowLeft') keys.current.q = false;
+      if (k === kb.backward || e.key === 'ArrowDown') keys.current.s = false;
+      if (k === kb.right || e.key === 'ArrowRight') keys.current.d = false;
+      if (k === kb.plant.toLowerCase() || e.code === 'Space') keys.current.space = false;
     };
 
     const handleWheel = (e) => {
@@ -886,7 +952,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
       window.removeEventListener('keyup', handleKeyUp);
       canvasEl.removeEventListener('wheel', handleWheel);
     };
-  }, [gl]);
+  }, [gl, keybindings]);
 
   useFrame(({ clock }, delta) => {
     if (!playerRef.current) return;
@@ -904,7 +970,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
     } else {
       idleTimer.current += delta;
     }
-    idleBlend.current = THREE.MathUtils.lerp(idleBlend.current, idleTimer.current > IDLE_LOOK_AFTER ? 1 : 0, 0.04);
+    idleBlend.current = THREE.MathUtils.lerp(idleBlend.current, (idleTimer.current > IDLE_LOOK_AFTER && !reduceMotion) ? 1 : 0, 0.04);
     if (headRef.current) {
       headRef.current.rotation.y = Math.sin(clock.getElapsedTime() * 0.4) * 0.4 * idleBlend.current;
     }
@@ -1013,7 +1079,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
         .add(upNormal.multiplyScalar(5.0 * zoomFactor.current));
 
       if (!cameraLocked) {
-        if (idleTimer.current > SCREENSAVER_AFTER) {
+        if (idleTimer.current > SCREENSAVER_AFTER && !reduceMotion) {
           // Personne n'a touché aux commandes depuis un moment : la caméra
           // se met à orbiter doucement autour du globe, façon écran de veille.
           const orbitT = clock.getElapsedTime() * 0.06;
@@ -1380,6 +1446,207 @@ const GlobeWithCountries = ({ onHoverCountry, onClickCountry, setCountriesData, 
 };
 
 // 8. Composant Principal
+const SettingsButton = ({ onClick }) => (
+  <button
+    onClick={onClick}
+    title="Paramètres"
+    style={{
+      position: 'absolute', bottom: 30, right: 30, zIndex: 10, width: 46, height: 46,
+      borderRadius: '50%', border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(15,23,42,0.85)',
+      color: '#fff', fontSize: 20, cursor: 'pointer', backdropFilter: 'blur(10px)',
+      boxShadow: '0 10px 15px -3px rgba(0,0,0,0.3)',
+    }}
+  >
+    ⚙️
+  </button>
+);
+
+const SETTINGS_ACTIONS = [
+  { key: 'forward', label: 'Avancer' },
+  { key: 'backward', label: 'Reculer' },
+  { key: 'left', label: 'Tourner à gauche' },
+  { key: 'right', label: 'Tourner à droite' },
+  { key: 'plant', label: 'Planter un drapeau' },
+];
+
+const SettingsPanel = ({ settings, setSettings, onClose, onExport, onImport, onReset }) => {
+  const [listeningFor, setListeningFor] = useState(null);
+  const [confirmingReset, setConfirmingReset] = useState(false);
+  const [resetDone, setResetDone] = useState(false);
+
+  useEffect(() => {
+    if (!listeningFor) return;
+    const handler = (e) => {
+      e.preventDefault();
+      if (e.key === 'Escape') { setListeningFor(null); return; }
+      const newKey = e.key.length === 1 ? e.key.toLowerCase() : e.key.toLowerCase();
+      if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'tab'].includes(newKey)) {
+        setListeningFor(null);
+        return;
+      }
+      setSettings((prev) => {
+        const kb = { ...prev.keybindings };
+        // Si cette touche est déjà utilisée par une autre action, on
+        // échange les deux plutôt que de laisser deux actions sur la même
+        // touche (évite les conflits silencieux).
+        const conflictAction = Object.keys(kb).find((a) => a !== listeningFor && kb[a] === newKey);
+        if (conflictAction) kb[conflictAction] = kb[listeningFor];
+        kb[listeningFor] = newKey;
+        return { ...prev, keybindings: kb };
+      });
+      setListeningFor(null);
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [listeningFor, setSettings]);
+
+  const update = (patch) => setSettings((prev) => ({ ...prev, ...patch }));
+
+  const sectionTitle = { fontSize: 13, textTransform: 'uppercase', letterSpacing: 0.6, opacity: 0.6, margin: '0 0 10px 0' };
+  const row = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '8px 0', fontSize: 14 };
+
+  return (
+    <div
+      style={{
+        position: 'absolute', inset: 0, zIndex: 200, background: 'rgba(0,0,0,0.6)',
+        display: 'flex', alignItems: 'center', justifyContent: 'center', animation: 'panelFadeIn 0.2s ease-out',
+      }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: 420, maxWidth: '92vw', maxHeight: '85vh', overflowY: 'auto',
+          background: 'rgba(15,23,42,0.97)', border: '1px solid rgba(255,255,255,0.15)',
+          borderRadius: 16, padding: 24, color: '#fff', boxShadow: '0 20px 40px rgba(0,0,0,0.5)',
+        }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <h2 style={{ margin: 0, fontSize: 20 }}>⚙️ Paramètres</h2>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#fff', fontSize: 20, cursor: 'pointer' }}>✕</button>
+        </div>
+
+        {/* Contrôles */}
+        <div style={{ marginBottom: 24 }}>
+          <p style={sectionTitle}>Contrôles</p>
+          {SETTINGS_ACTIONS.map(({ key, label }) => (
+            <div key={key} style={row}>
+              <span>{label}</span>
+              <button
+                onClick={() => setListeningFor(key)}
+                style={{
+                  minWidth: 64, padding: '6px 10px', borderRadius: 6, cursor: 'pointer',
+                  border: listeningFor === key ? '1px solid #4ADE80' : '1px solid rgba(255,255,255,0.2)',
+                  background: listeningFor === key ? 'rgba(74,222,128,0.15)' : 'rgba(255,255,255,0.06)',
+                  color: '#fff', fontFamily: 'monospace', fontWeight: 'bold',
+                }}
+              >
+                {listeningFor === key ? '...' : formatKeyLabel(settings.keybindings[key])}
+              </button>
+            </div>
+          ))}
+          <p style={{ fontSize: 11, opacity: 0.5, margin: '8px 0 0 0' }}>
+            Les flèches directionnelles fonctionnent toujours en plus, quels que soient ces réglages.
+            Cliquez sur une touche puis appuyez sur la nouvelle touche voulue (Échap pour annuler).
+          </p>
+        </div>
+
+        {/* Graphismes */}
+        <div style={{ marginBottom: 24 }}>
+          <p style={sectionTitle}>Graphismes</p>
+          <label style={row}>
+            <span>Effet de lueur (bloom)</span>
+            <input type="checkbox" checked={settings.bloom} onChange={(e) => update({ bloom: e.target.checked })} />
+          </label>
+          <label style={row}>
+            <span>Ombres</span>
+            <input type="checkbox" checked={settings.shadows} onChange={(e) => update({ shadows: e.target.checked })} />
+          </label>
+          <label style={row}>
+            <span>Réduire les animations</span>
+            <input type="checkbox" checked={settings.reduceMotion} onChange={(e) => update({ reduceMotion: e.target.checked })} />
+          </label>
+          <p style={{ fontSize: 11, opacity: 0.5, margin: '4px 0 0 0' }}>
+            Désactive le regard "idle" et la rotation caméra en écran de veille.
+          </p>
+        </div>
+
+        {/* Son */}
+        <div style={{ marginBottom: 24 }}>
+          <p style={sectionTitle}>Son <span style={{ opacity: 0.5, textTransform: 'none' }}>(pas encore implémenté)</span></p>
+          <div style={row}>
+            <span>Volume général</span>
+            <input
+              type="range" min={0} max={1} step={0.05} value={settings.soundMaster}
+              onChange={(e) => update({ soundMaster: parseFloat(e.target.value) })}
+              style={{ width: 120 }}
+            />
+          </div>
+          <label style={row}>
+            <span>Pas sur la terre</span>
+            <input type="checkbox" checked={settings.soundFootsteps} onChange={(e) => update({ soundFootsteps: e.target.checked })} />
+          </label>
+          <label style={row}>
+            <span>Rames sur l'eau</span>
+            <input type="checkbox" checked={settings.soundOars} onChange={(e) => update({ soundOars: e.target.checked })} />
+          </label>
+          <label style={row}>
+            <span>Plantation de drapeau</span>
+            <input type="checkbox" checked={settings.soundFlag} onChange={(e) => update({ soundFlag: e.target.checked })} />
+          </label>
+          <p style={{ fontSize: 11, opacity: 0.5, margin: '4px 0 0 0' }}>
+            Ces réglages sont déjà sauvegardés et prêts — les sons eux-mêmes arriveront dans une prochaine mise à jour.
+          </p>
+        </div>
+
+        {/* Données */}
+        <div>
+          <p style={sectionTitle}>Données</p>
+          <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+            <button onClick={onExport} style={{ flex: 1, padding: '8px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.06)', color: '#fff', cursor: 'pointer', fontSize: 13 }}>
+              ⬇️ Exporter (JSON)
+            </button>
+            <label style={{ flex: 1, padding: '8px 10px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.06)', color: '#fff', cursor: 'pointer', fontSize: 13, textAlign: 'center' }}>
+              ⬆️ Importer
+              <input type="file" accept="application/json" onChange={onImport} style={{ display: 'none' }} />
+            </label>
+          </div>
+
+          {!confirmingReset ? (
+            <button
+              onClick={() => setConfirmingReset(true)}
+              style={{ width: '100%', padding: '10px 12px', borderRadius: 8, border: '1px solid rgba(239,68,68,0.4)', background: 'rgba(239,68,68,0.12)', color: '#F87171', cursor: 'pointer', fontWeight: 'bold' }}
+            >
+              🗑️ Réinitialiser l'application
+            </button>
+          ) : (
+            <div style={{ border: '1px solid rgba(239,68,68,0.4)', background: 'rgba(239,68,68,0.08)', borderRadius: 8, padding: 12 }}>
+              <p style={{ margin: '0 0 10px 0', fontSize: 13 }}>
+                ⚠️ Cette action supprime <strong>définitivement</strong> tous vos drapeaux, notes, notes sur 10 et photos. Pensez à exporter avant si besoin.
+              </p>
+              <div style={{ display: 'flex', gap: 8 }}>
+                <button
+                  onClick={async () => { await onReset(); setConfirmingReset(false); setResetDone(true); setTimeout(() => setResetDone(false), 2500); }}
+                  style={{ flex: 1, padding: '8px 10px', borderRadius: 6, border: 'none', background: '#EF4444', color: '#fff', fontWeight: 'bold', cursor: 'pointer' }}
+                >
+                  Oui, tout supprimer
+                </button>
+                <button
+                  onClick={() => setConfirmingReset(false)}
+                  style={{ flex: 1, padding: '8px 10px', borderRadius: 6, border: 'none', background: 'rgba(255,255,255,0.15)', color: '#fff', cursor: 'pointer' }}
+                >
+                  Annuler
+                </button>
+              </div>
+            </div>
+          )}
+          {resetDone && <p style={{ fontSize: 12, color: '#4ADE80', margin: '8px 0 0 0' }}>✓ Application réinitialisée.</p>}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 const TravelPortfolioScene = () => {
   const [hoveredCountry, setHoveredCountry] = useState(null);
   const [selectedCountry, setSelectedCountry] = useState(null);
@@ -1401,7 +1668,51 @@ const TravelPortfolioScene = () => {
   const [wikiInfo, setWikiInfo] = useState(null);
   const [wikiLoading, setWikiLoading] = useState(false);
 
+  // Paramètres (touches, graphismes, son) + panneau associé
+  const [settings, setSettings] = useState(loadSettings);
+  const [showSettings, setShowSettings] = useState(false);
+
   const cameraLocked = !!activePopupFlag || returningCamera;
+
+  useEffect(() => { saveSettings(settings); }, [settings]);
+
+  // Exporte les drapeaux/notes/photos actuels en fichier JSON téléchargeable
+  // (sauvegarde manuelle, utile avant une réinitialisation par exemple).
+  const exportData = () => {
+    const serializable = visitedFlags.map((f) => ({ ...f, position: { x: f.position.x, y: f.position.y, z: f.position.z } }));
+    const blob = new Blob([JSON.stringify(serializable, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `countries-been-${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Importe un fichier JSON précédemment exporté (remplace les données actuelles).
+  const importData = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        if (!Array.isArray(parsed)) throw new Error('format invalide');
+        setVisitedFlags(parsed.map((f) => ({ ...f, position: new THREE.Vector3(f.position.x, f.position.y, f.position.z) })));
+      } catch (err) {
+        alert("Ce fichier n'est pas un export valide de Countries Been.");
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+  };
+
+  // Réinitialise complètement l'application (drapeaux, notes, photos).
+  const resetApp = async () => {
+    await idbClearFlags();
+    setVisitedFlags([]);
+    setActivePopupFlag(null);
+  };
 
   // Charge les drapeaux sauvegardés au tout premier montage.
   useEffect(() => {
@@ -1542,7 +1853,7 @@ const TravelPortfolioScene = () => {
         {visitedFlags.length} pays visité{visitedFlags.length > 1 ? 's' : ''}
       </div>
 
-      <Canvas shadows camera={{ position: [0, 0, 14], fov: 45 }}>
+      <Canvas shadows={settings.shadows} camera={{ position: [0, 0, 14], fov: 45 }}>
         <ambientLight intensity={0.28} />
         <RotatingSun />
         <directionalLight position={[-10, -10, -5]} intensity={0.12} color="#90b0d0" />
@@ -1557,6 +1868,8 @@ const TravelPortfolioScene = () => {
           onPlantFlag={handlePlantFlag}
           visitedFlags={visitedFlags}
           cameraLocked={cameraLocked}
+          keybindings={settings.keybindings}
+          reduceMotion={settings.reduceMotion}
         />
 
         <GlobeWithCountries 
@@ -1581,15 +1894,29 @@ const TravelPortfolioScene = () => {
 
         <CameraFocusRig focusFlag={activePopupFlag} onSettled={() => setReturningCamera(false)} />
         <CountryZoomLabel flag={activePopupFlag} />
-        <EffectComposer>
-          <Bloom
-            luminanceThreshold={0.35}
-            luminanceSmoothing={0.9}
-            intensity={0.9}
-            mipmapBlur
-          />
-        </EffectComposer>
+        {settings.bloom && (
+          <EffectComposer>
+            <Bloom
+              luminanceThreshold={0.35}
+              luminanceSmoothing={0.9}
+              intensity={0.9}
+              mipmapBlur
+            />
+          </EffectComposer>
+        )}
       </Canvas>
+
+      <SettingsButton onClick={() => setShowSettings(true)} />
+      {showSettings && (
+        <SettingsPanel
+          settings={settings}
+          setSettings={setSettings}
+          onClose={() => setShowSettings(false)}
+          onExport={exportData}
+          onImport={importData}
+          onReset={resetApp}
+        />
+      )}
 
       {/* Animations CSS (label géant sur le globe + glissement du panneau) */}
       <style>{`
