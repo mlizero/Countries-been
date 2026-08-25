@@ -38,6 +38,68 @@ function projectGeometryToSphere(geometry, baseRadius = 5) {
 // semble alors passer sous l'eau en son centre. On corrige en insérant des
 // points intermédiaires le long des arêtes du polygone AVANT extrusion, pour
 // qu'aucun triangle ne couvre plus que `maxStepDeg` degrés d'un coup.
+// --- Persistance locale (IndexedDB) -----------------------------------
+// On utilise IndexedDB plutôt que localStorage car les photos sont stockées
+// en base64 dans les notes : le quota de localStorage (~5-10 Mo au total)
+// serait vite dépassé, alors qu'IndexedDB tient largement plus (centaines
+// de Mo selon le navigateur). Un vrai "compte" multi-appareils demanderait
+// un serveur + une authentification + une base de données — hors de portée
+// pour ce fichier front-end seul. Ceci couvre "je ferme et je rouvre le
+// navigateur, mes données sont toujours là" sur le même appareil.
+const IDB_NAME = 'countries-been-db';
+const IDB_STORE = 'data';
+const IDB_KEY = 'visitedFlags';
+
+function idbOpen() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
+        req.result.createObjectStore(IDB_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function idbLoadFlags() {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readonly');
+      const req = tx.objectStore(IDB_STORE).get(IDB_KEY);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch (err) {
+    console.error('Erreur de chargement des données sauvegardées :', err);
+    return null;
+  }
+}
+
+async function idbSaveFlags(flags) {
+  try {
+    const db = await idbOpen();
+    // Les positions sont des THREE.Vector3 : on les sérialise en objets
+    // simples {x,y,z} pour le stockage, on les reconstruira au chargement.
+    const serializable = flags.map((f) => ({
+      ...f,
+      position: { x: f.position.x, y: f.position.y, z: f.position.z },
+    }));
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, 'readwrite');
+      tx.objectStore(IDB_STORE).put(serializable, IDB_KEY);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    return true;
+  } catch (err) {
+    console.error('Erreur de sauvegarde :', err);
+    return false;
+  }
+}
+
 function densifyRing(ring, maxStepDeg = 3) {
   if (!ring || ring.length < 2) return ring;
   const out = [];
@@ -1325,6 +1387,8 @@ const TravelPortfolioScene = () => {
   const [isOnWater, setIsOnWater] = useState(false);
   
   const [visitedFlags, setVisitedFlags] = useState([]);
+  const [flagsLoaded, setFlagsLoaded] = useState(false);
+  const [saveNotice, setSaveNotice] = useState(null); // null | 'saving' | 'saved' | 'error'
   const [activePopupFlag, setActivePopupFlag] = useState(null);
   const [returningCamera, setReturningCamera] = useState(false);
 
@@ -1338,6 +1402,32 @@ const TravelPortfolioScene = () => {
   const [wikiLoading, setWikiLoading] = useState(false);
 
   const cameraLocked = !!activePopupFlag || returningCamera;
+
+  // Charge les drapeaux sauvegardés au tout premier montage.
+  useEffect(() => {
+    let cancelled = false;
+    idbLoadFlags().then((saved) => {
+      if (cancelled) return;
+      if (saved && Array.isArray(saved)) {
+        setVisitedFlags(saved.map((f) => ({ ...f, position: new THREE.Vector3(f.position.x, f.position.y, f.position.z) })));
+      }
+      setFlagsLoaded(true);
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  // Sauvegarde automatique à chaque changement (nouveau drapeau, suppression,
+  // note/photo/note enregistrée). On ignore le tout premier rendu (avant que
+  // le chargement initial soit terminé) pour ne pas écraser la sauvegarde
+  // existante avec un tableau vide au démarrage.
+  useEffect(() => {
+    if (!flagsLoaded) return;
+    setSaveNotice('saving');
+    idbSaveFlags(visitedFlags).then((ok) => {
+      setSaveNotice(ok ? 'saved' : 'error');
+      setTimeout(() => setSaveNotice(null), ok ? 1200 : 4000);
+    });
+  }, [visitedFlags, flagsLoaded]);
 
   const handlePlantFlag = (position) => {
     if (!selectedCountry || isOnWater) return;
@@ -1640,6 +1730,13 @@ const TravelPortfolioScene = () => {
         <p style={{ margin: '5px 0 0 0', opacity: 0.8 }}>
           {isOnWater ? '🌊 En navigation (Chaloupe)' : `🚶‍♂️ Territoire : ${selectedCountry || 'Inconnu'} ${visitedFlags.some(f => f.country === selectedCountry) ? '(Drapeau déjà posé)' : '(Appuyez sur ESPACE pour planter un drapeau)'}`}
         </p>
+        {saveNotice && (
+          <p style={{ margin: '6px 0 0 0', fontSize: 12, opacity: 0.7, color: saveNotice === 'error' ? '#F87171' : '#4ADE80' }}>
+            {saveNotice === 'saving' && '💾 Sauvegarde...'}
+            {saveNotice === 'saved' && '✓ Sauvegardé'}
+            {saveNotice === 'error' && '⚠️ Échec de la sauvegarde (stockage plein ?)'}
+          </p>
+        )}
       </div>
     </div>
   );
