@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect, useMemo } from 'react';
+import React, { useRef, useState, useEffect, useMemo, useContext } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
 import { Stars, RoundedBox, MeshDistortMaterial, Html } from '@react-three/drei';
 import { EffectComposer, Bloom } from '@react-three/postprocessing';
@@ -49,18 +49,58 @@ function projectGeometryToSphere(geometry, baseRadius = 5) {
 const IDB_NAME = 'countries-been-db';
 const IDB_STORE = 'data';
 const IDB_KEY = 'visitedFlags';
+const IDB_GEO_STORE = 'geometryCache';
+// Incrémenter cette version invalide tout le cache géométrique existant —
+// utile si un jour l'algorithme de subdivision/projection change encore
+// (sinon on resservirait indéfiniment de vieilles géométries obsolètes).
+const GEOMETRY_CACHE_VERSION = 1;
 
 function idbOpen() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(IDB_NAME, 1);
+    const req = indexedDB.open(IDB_NAME, 2);
     req.onupgradeneeded = () => {
-      if (!req.result.objectStoreNames.contains(IDB_STORE)) {
-        req.result.createObjectStore(IDB_STORE);
-      }
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) db.createObjectStore(IDB_STORE);
+      if (!db.objectStoreNames.contains(IDB_GEO_STORE)) db.createObjectStore(IDB_GEO_STORE);
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
+}
+
+// --- Cache des géométries de pays (fix "niveau de la mer") --------------
+// La subdivision + triangulation + projection sphérique de chaque pays est
+// le calcul le plus coûteux au démarrage (jusqu'à ~13 000 triangles pour un
+// grand pays comme l'Antarctique). On le met en cache dans IndexedDB par
+// pays (clé = id ISO3 du GeoJSON) pour ne le refaire qu'une seule fois,
+// jamais à chaque rechargement de page.
+async function idbGetGeometry(countryId) {
+  try {
+    const db = await idbOpen();
+    return await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_GEO_STORE, 'readonly');
+      const req = tx.objectStore(IDB_GEO_STORE).get(`${GEOMETRY_CACHE_VERSION}:${countryId}`);
+      req.onsuccess = () => resolve(req.result || null);
+      req.onerror = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function idbSetGeometry(countryId, parts) {
+  try {
+    const db = await idbOpen();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_GEO_STORE, 'readwrite');
+      tx.objectStore(IDB_GEO_STORE).put(parts, `${GEOMETRY_CACHE_VERSION}:${countryId}`);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // Pas grave si le cache échoue (quota plein, navigateur restrictif...) :
+    // on retombe simplement sur un recalcul au prochain chargement.
+  }
 }
 
 async function idbLoadFlags() {
@@ -127,6 +167,7 @@ const DEFAULT_SETTINGS = {
   bloom: true,
   shadows: true,
   reduceMotion: false,
+  soundMuted: false,
   soundMaster: 0.7,
   soundFootsteps: true,
   soundOars: true,
@@ -163,6 +204,132 @@ const KEY_LABELS = { ' ': 'ESPACE', 'arrowup': '↑', 'arrowdown': '↓', 'arrow
 function formatKeyLabel(key) {
   if (!key) return '?';
   return KEY_LABELS[key.toLowerCase()] || key.toUpperCase();
+}
+
+// Le jeu de données GeoJSON ne fournit que le nom du pays (pas de continent),
+// donc cette table est nécessaire pour les statistiques par continent.
+// NB : quelques pays transcontinentaux (Russie, Turquie, Géorgie, Azerbaïdjan,
+// Arménie, Chypre...) sont classés selon une convention courante mais
+// discutable — à ajuster si besoin.
+const COUNTRY_CONTINENTS = {
+  Afghanistan: 'Asie', Albania: 'Europe', Algeria: 'Afrique', Angola: 'Afrique',
+  Antarctica: 'Antarctique', Argentina: 'Amérique du Sud', Armenia: 'Asie',
+  Australia: 'Océanie', Austria: 'Europe', Azerbaijan: 'Asie', Bangladesh: 'Asie',
+  Belarus: 'Europe', Belgium: 'Europe', Belize: 'Amérique du Nord', Benin: 'Afrique',
+  Bermuda: 'Amérique du Nord', Bhutan: 'Asie', Bolivia: 'Amérique du Sud',
+  'Bosnia and Herzegovina': 'Europe', Botswana: 'Afrique', Brazil: 'Amérique du Sud',
+  Brunei: 'Asie', Bulgaria: 'Europe', 'Burkina Faso': 'Afrique', Burundi: 'Afrique',
+  Cambodia: 'Asie', Cameroon: 'Afrique', Canada: 'Amérique du Nord',
+  'Central African Republic': 'Afrique', Chad: 'Afrique', Chile: 'Amérique du Sud',
+  China: 'Asie', Colombia: 'Amérique du Sud', 'Costa Rica': 'Amérique du Nord',
+  Croatia: 'Europe', Cuba: 'Amérique du Nord', Cyprus: 'Europe', 'Czech Republic': 'Europe',
+  'Democratic Republic of the Congo': 'Afrique', Denmark: 'Europe', Djibouti: 'Afrique',
+  'Dominican Republic': 'Amérique du Nord', 'East Timor': 'Asie', Ecuador: 'Amérique du Sud',
+  Egypt: 'Afrique', 'El Salvador': 'Amérique du Nord', 'Equatorial Guinea': 'Afrique',
+  Eritrea: 'Afrique', Estonia: 'Europe', Ethiopia: 'Afrique', 'Falkland Islands': 'Amérique du Sud',
+  Fiji: 'Océanie', Finland: 'Europe', France: 'Europe', 'French Guiana': 'Amérique du Sud',
+  'French Southern and Antarctic Lands': 'Antarctique', Gabon: 'Afrique', Gambia: 'Afrique',
+  Georgia: 'Asie', Germany: 'Europe', Ghana: 'Afrique', Greece: 'Europe', Greenland: 'Amérique du Nord',
+  Guatemala: 'Amérique du Nord', Guinea: 'Afrique', 'Guinea Bissau': 'Afrique', Guyana: 'Amérique du Sud',
+  Haiti: 'Amérique du Nord', Honduras: 'Amérique du Nord', Hungary: 'Europe', Iceland: 'Europe',
+  India: 'Asie', Indonesia: 'Asie', Iran: 'Asie', Iraq: 'Asie', Ireland: 'Europe', Israel: 'Asie',
+  Italy: 'Europe', 'Ivory Coast': 'Afrique', Jamaica: 'Amérique du Nord', Japan: 'Asie',
+  Jordan: 'Asie', Kazakhstan: 'Asie', Kenya: 'Afrique', Kosovo: 'Europe', Kuwait: 'Asie',
+  Kyrgyzstan: 'Asie', Laos: 'Asie', Latvia: 'Europe', Lebanon: 'Asie', Lesotho: 'Afrique',
+  Liberia: 'Afrique', Libya: 'Afrique', Lithuania: 'Europe', Luxembourg: 'Europe',
+  Macedonia: 'Europe', Madagascar: 'Afrique', Malawi: 'Afrique', Malaysia: 'Asie', Mali: 'Afrique',
+  Malta: 'Europe', Mauritania: 'Afrique', Mexico: 'Amérique du Nord', Moldova: 'Europe',
+  Mongolia: 'Asie', Montenegro: 'Europe', Morocco: 'Afrique', Mozambique: 'Afrique',
+  Myanmar: 'Asie', Namibia: 'Afrique', Nepal: 'Asie', Netherlands: 'Europe',
+  'New Caledonia': 'Océanie', 'New Zealand': 'Océanie', Nicaragua: 'Amérique du Nord',
+  Niger: 'Afrique', Nigeria: 'Afrique', 'North Korea': 'Asie', 'Northern Cyprus': 'Europe',
+  Norway: 'Europe', Oman: 'Asie', Pakistan: 'Asie', Panama: 'Amérique du Nord',
+  'Papua New Guinea': 'Océanie', Paraguay: 'Amérique du Sud', Peru: 'Amérique du Sud',
+  Philippines: 'Asie', Poland: 'Europe', Portugal: 'Europe', 'Puerto Rico': 'Amérique du Nord',
+  Qatar: 'Asie', 'Republic of Serbia': 'Europe', 'Republic of the Congo': 'Afrique',
+  Romania: 'Europe', Russia: 'Europe', Rwanda: 'Afrique', 'Saudi Arabia': 'Asie',
+  Senegal: 'Afrique', 'Sierra Leone': 'Afrique', Slovakia: 'Europe', Slovenia: 'Europe',
+  'Solomon Islands': 'Océanie', Somalia: 'Afrique', Somaliland: 'Afrique', 'South Africa': 'Afrique',
+  'South Korea': 'Asie', 'South Sudan': 'Afrique', Spain: 'Europe', 'Sri Lanka': 'Asie',
+  Sudan: 'Afrique', Suriname: 'Amérique du Sud', Swaziland: 'Afrique', Sweden: 'Europe',
+  Switzerland: 'Europe', Syria: 'Asie', Taiwan: 'Asie', Tajikistan: 'Asie', Thailand: 'Asie',
+  'The Bahamas': 'Amérique du Nord', Togo: 'Afrique', 'Trinidad and Tobago': 'Amérique du Nord',
+  Tunisia: 'Afrique', Turkey: 'Asie', Turkmenistan: 'Asie', Uganda: 'Afrique', Ukraine: 'Europe',
+  'United Arab Emirates': 'Asie', 'United Kingdom': 'Europe', 'United Republic of Tanzania': 'Afrique',
+  'United States of America': 'Amérique du Nord', Uruguay: 'Amérique du Sud', Uzbekistan: 'Asie',
+  Vanuatu: 'Océanie', Venezuela: 'Amérique du Sud', Vietnam: 'Asie', 'West Bank': 'Asie',
+  'Western Sahara': 'Afrique', Yemen: 'Asie', Zambia: 'Afrique', Zimbabwe: 'Afrique',
+};
+
+// Point représentatif d'un pays (pour la téléportation via la recherche) :
+// centroïde du plus grand sous-polygone (le plus de sommets = la masse
+// terrestre principale), projeté sur la sphère au rayon de marche du joueur.
+function getCountryWalkPoint(feature, radius = 4.96) {
+  const type = feature.geometry.type;
+  const polygons = type === 'Polygon' ? [feature.geometry.coordinates] : feature.geometry.coordinates;
+  let best = null;
+  polygons.forEach((polygonCoords) => {
+    const ring = polygonCoords[0];
+    if (!ring || (best && ring.length <= best.length)) return;
+    best = ring;
+  });
+  if (!best) return null;
+  let sumLon = 0, sumLat = 0;
+  const n = best.length - 1; // le dernier point ferme l'anneau (== le premier)
+  for (let i = 0; i < n; i++) {
+    sumLon += best[i][0];
+    sumLat += best[i][1];
+  }
+  const lon = sumLon / n;
+  const lat = sumLat / n;
+  const phi = (90 - lat) * (Math.PI / 180);
+  const theta = (lon + 180) * (Math.PI / 180);
+  const x = -(radius * Math.sin(phi) * Math.cos(theta));
+  const z = radius * Math.sin(phi) * Math.sin(theta);
+  const y = radius * Math.cos(phi);
+  return new THREE.Vector3(x, y, z);
+}
+
+// Récupère et parse le GeoJSON dans un Web Worker plutôt que sur le thread
+// principal. Le fichier fait plusieurs Mo : le fetch ne bloque déjà rien
+// (asynchrone), mais `JSON.parse()` d'une chaîne de plusieurs Mo, lui, EST
+// synchrone et peut geler l'affichage un instant au démarrage. Le worker est
+// créé à la volée via un Blob (pas besoin d'un fichier séparé à déployer) et
+// n'a besoin que de `fetch`/`JSON.parse`, donc aucune dépendance à charger
+// dans son contexte.
+function fetchGeoJSONInWorker(url) {
+  return new Promise((resolve, reject) => {
+    if (typeof Worker === 'undefined') {
+      fetch(url).then((res) => res.json()).then(resolve).catch(reject);
+      return;
+    }
+    const workerSource = `
+      self.onmessage = async () => {
+        try {
+          const res = await fetch(${JSON.stringify(url)});
+          const text = await res.text();
+          const data = JSON.parse(text);
+          self.postMessage({ ok: true, data });
+        } catch (err) {
+          self.postMessage({ ok: false, error: String((err && err.message) || err) });
+        }
+      };
+    `;
+    const blobUrl = URL.createObjectURL(new Blob([workerSource], { type: 'application/javascript' }));
+    const worker = new Worker(blobUrl);
+    worker.onmessage = (e) => {
+      worker.terminate();
+      URL.revokeObjectURL(blobUrl);
+      if (e.data.ok) resolve(e.data.data);
+      else reject(new Error(e.data.error));
+    };
+    worker.onerror = (err) => {
+      worker.terminate();
+      URL.revokeObjectURL(blobUrl);
+      reject(err);
+    };
+    worker.postMessage(null);
+  });
 }
 
 function densifyRing(ring, maxStepDeg = 3) {
@@ -777,9 +944,10 @@ const RatingStars = ({ value = 0, onChange, size = 18 }) => (
 );
 
 
-const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, visitedFlags, cameraLocked, keybindings, reduceMotion }) => {
+const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, visitedFlags, cameraLocked, keybindings, reduceMotion, teleportTarget, headingRef }) => {
   const playerRef = useRef();
   const { camera, gl } = useThree();
+  const { playFootstep, playOar, playFlagPlant, startWaterAmbient, stopWaterAmbient } = useSound();
   
   const legL = useRef();
   const legR = useRef();
@@ -788,7 +956,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
   const bodyRef = useRef();
   const oarRef = useRef();
 
-  const playerPos = useRef(new THREE.Vector3(0, 5.12, 0));
+  const playerPos = useRef(new THREE.Vector3(0, 4.96, 0));
   const playerDir = useRef(new THREE.Vector3(0, 0, 1));
   const keys = useRef({ z: false, q: false, s: false, d: false, space: false });
   // Distance de la caméra par rapport au joueur, ajustable à la molette
@@ -798,9 +966,43 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
   const cameraLockedRef = useRef(cameraLocked);
   useEffect(() => { cameraLockedRef.current = cameraLocked; }, [cameraLocked]);
 
+  // Téléportation (barre de recherche) : on saute directement le joueur à la
+  // position demandée, avec un cadrage caméra immédiat (pas de lerp) pour
+  // éviter un long "rattrapage" visuel après un saut de plusieurs milliers
+  // de km d'un coup.
+  useEffect(() => {
+    if (!teleportTarget || !playerRef.current) return;
+    const radius = 4.96;
+    playerPos.current.copy(teleportTarget).normalize().multiplyScalar(radius);
+    playerRef.current.position.copy(playerPos.current);
+    const up = playerPos.current.clone().normalize();
+    // Garde une direction de marche tangente valide (nord local par défaut).
+    let north = new THREE.Vector3(0, 1, 0).sub(up.clone().multiplyScalar(up.y));
+    if (north.lengthSq() < 1e-6) north.set(1, 0, 0);
+    playerDir.current.copy(north.normalize());
+    const targetLook = playerPos.current.clone().add(playerDir.current);
+    const matrix = new THREE.Matrix4().lookAt(playerPos.current, targetLook, up);
+    playerRef.current.quaternion.setFromRotationMatrix(matrix);
+
+    const backwardDir = playerDir.current.clone().negate();
+    const idealCameraPos = playerPos.current.clone()
+      .add(backwardDir.multiplyScalar(2.8 * zoomFactor.current))
+      .add(up.clone().multiplyScalar(5.0 * zoomFactor.current));
+    camera.position.copy(idealCameraPos);
+    camera.up.copy(up);
+    camera.lookAt(playerPos.current);
+  }, [teleportTarget]);
+
   const [isOnWater, setIsOnWater] = useState(false);
   const [showFlagInHand, setShowFlagInHand] = useState(false);
   const [transitionProgress, setTransitionProgress] = useState(1);
+
+  // Ambiance d'eau : démarre/s'arrête avec l'état terre/eau réellement acté
+  // (donc après le debounce anti-flapping des archipels, pas à chaque frame).
+  useEffect(() => {
+    if (isOnWater) startWaterAmbient(); else stopWaterAmbient();
+  }, [isOnWater]);
+  useEffect(() => () => stopWaterAmbient(), []);
   
   const isPlacingFlag = useRef(false);
   const plantAnimTime = useRef(0);
@@ -857,6 +1059,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
   );
   const wakeIndex = useRef(0);
   const wakeSpawnTimer = useRef(0);
+  const oarSoundTimer = useRef(0);
   const spawnWake = (origin, dir) => {
     const i = wakeIndex.current;
     wakeIndex.current = (i + 1) % WAKE_COUNT;
@@ -959,7 +1162,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
     if (cameraLocked) return; // le joueur est figé pendant qu'on consulte un pays
 
     let isMoving = false;
-    const radius = 5.12;
+    const radius = 4.96;
 
     // Minuteur d'inactivité : recalculé en tout début de frame car il ne
     // dépend que de l'état courant des touches, pas du reste du mouvement.
@@ -1000,6 +1203,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
           setShowFlagInHand(false);
           if (onPlantFlag) onPlantFlag(playerPos.current.clone());
           spawnConfetti(playerPos.current, playerPos.current.clone().normalize());
+          playFlagPlant();
         }
 
         if (elapsed > 1.0) {
@@ -1073,6 +1277,20 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
       if (onWaterChange) onWaterChange(waterState);
       if (onLocationChange) onLocationChange(currentCountry);
 
+      // Cap de la boussole : écrit directement dans une ref mutable (pas de
+      // setState ici). Avant, `onHeadingChange` appelait un setState à
+      // *chaque frame* pendant tout mouvement, ce qui re-rendait tout
+      // TravelPortfolioScene (panneaux, listes, etc.) 60x/seconde — c'était
+      // la vraie cause du ralentissement, pas la boussole en elle-même.
+      if (headingRef) {
+        let north = new THREE.Vector3(0, 1, 0).sub(upNormal.clone().multiplyScalar(upNormal.y));
+        if (north.lengthSq() < 1e-6) north.set(1, 0, 0);
+        north.normalize();
+        const east = new THREE.Vector3().crossVectors(north, upNormal).normalize();
+        const heading = (Math.atan2(playerDir.current.dot(east), playerDir.current.dot(north)) * 180 / Math.PI + 360) % 360;
+        headingRef.current = heading;
+      }
+
       const backwardDir = playerDir.current.clone().negate();
       const idealCameraPos = playerPos.current.clone()
         .add(backwardDir.multiplyScalar(2.8 * zoomFactor.current))
@@ -1122,6 +1340,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
           if (dustSpawnTimer.current <= 0) {
             dustSpawnTimer.current = 0.16;
             spawnDust(playerPos.current, playerPos.current.clone().normalize());
+            playFootstep();
           }
         } else if (isTurningKey) {
           // Rotation sur soi (Q/D seuls, sans avancer) : un pas chassé sur
@@ -1147,6 +1366,13 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
           if (wakeSpawnTimer.current <= 0) {
             wakeSpawnTimer.current = 0.09;
             spawnWake(playerPos.current, playerDir.current);
+          }
+          // Le son suit la cadence d'un vrai coup de rame (~1.5x/s), pas
+          // celle des particules de sillage (trop rapide -> crépitement).
+          oarSoundTimer.current -= delta;
+          if (oarSoundTimer.current <= 0) {
+            oarSoundTimer.current = 0.65;
+            playOar();
           }
         }
       }
@@ -1243,7 +1469,7 @@ const Player = ({ countriesData, onWaterChange, onLocationChange, onPlantFlag, v
 
   return (
     <>
-      <group ref={playerRef} position={[0, 5.12, 0]}>
+      <group ref={playerRef} position={[0, 4.96, 0]}>
         {isOnWater ? (
           <BoatWithRider oarRef={oarRef} transitionProgress={transitionProgress} />
         ) : (
@@ -1324,61 +1550,101 @@ const ConfettiParticles = ({ meshesRef, count }) => (
 );
 
 // 6. Un Pays Individuel
+// Construit les géométries (mesh extrudé + ligne de bordure) d'un pays à
+// partir de ses coordonnées brutes. C'est le calcul coûteux (densification +
+// triangulation earcut + subdivision anti-"sous le niveau de la mer" +
+// projection sphérique) — voir idbGetGeometry/idbSetGeometry pour la mise en cache.
+function buildCountryGeometryParts(feature) {
+  const parts = [];
+  const type = feature.geometry.type;
+  const coordinates = type === 'Polygon' ? [feature.geometry.coordinates] : feature.geometry.coordinates;
+
+  coordinates.forEach((polygonCoords) => {
+    const rawRing = polygonCoords[0];
+    if (!rawRing || rawRing.length < 3) return;
+    const outerRing = densifyRing(rawRing, 3);
+
+    const shape = new THREE.Shape();
+    outerRing.forEach(([lon, lat], index) => {
+      if (index === 0) shape.moveTo(lon, lat);
+      else shape.lineTo(lon, lat);
+    });
+
+    const extrudeSettings = { depth: 0.2, bevelEnabled: false };
+    let meshGeom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
+    meshGeom = subdivideFlatGeometry(meshGeom, 2.2);
+    projectGeometryToSphere(meshGeom, 4.75);
+
+    const borderPoints = [];
+    outerRing.forEach(([lon, lat]) => {
+      const r = 4.952;
+      const phi = (90 - lat) * (Math.PI / 180);
+      const theta = (lon + 180) * (Math.PI / 180);
+      const x = -(r * Math.sin(phi) * Math.cos(theta));
+      const z = (r * Math.sin(phi) * Math.sin(theta));
+      const y = (r * Math.cos(phi));
+      borderPoints.push(new THREE.Vector3(x, y, z));
+    });
+    const lineGeom = new THREE.BufferGeometry().setFromPoints(borderPoints);
+
+    parts.push({ meshGeom, lineGeom });
+  });
+  return parts;
+}
+
+// Sérialise les géométries calculées en tableaux Float32Array bruts
+// (stockables tels quels dans IndexedDB), et inversement les reconstruit en
+// vraies THREE.BufferGeometry sans repasser par tout le calcul.
+function geometryPartsToCache(parts) {
+  return parts.map(({ meshGeom, lineGeom }) => ({
+    meshPositions: meshGeom.attributes.position.array,
+    borderPositions: lineGeom.attributes.position.array,
+  }));
+}
+
+function geometryPartsFromCache(cached) {
+  return cached.map(({ meshPositions, borderPositions }) => {
+    const meshGeom = new THREE.BufferGeometry();
+    meshGeom.setAttribute('position', new THREE.BufferAttribute(meshPositions, 3));
+    meshGeom.computeVertexNormals();
+    meshGeom.computeBoundingSphere();
+    const lineGeom = new THREE.BufferGeometry();
+    lineGeom.setAttribute('position', new THREE.BufferAttribute(borderPositions, 3));
+    return { meshGeom, lineGeom };
+  });
+}
+
 const CountryMesh = ({ feature, onHover, onClick, activeCountry }) => {
   const [hovered, setHovered] = useState(false);
+  const [geometries, setGeometries] = useState(null);
 
-  const geometries = useMemo(() => {
-    const parts = [];
-    const type = feature.geometry.type;
-    const coordinates = type === 'Polygon' ? [feature.geometry.coordinates] : feature.geometry.coordinates;
+  useEffect(() => {
+    let cancelled = false;
+    const countryId = feature.id || feature.properties.name;
 
-    coordinates.forEach((polygonCoords) => {
-      const rawRing = polygonCoords[0];
-      if (!rawRing || rawRing.length < 3) return;
-      const outerRing = densifyRing(rawRing, 3);
-
-      const shape = new THREE.Shape();
-      outerRing.forEach(([lon, lat], index) => {
-        if (index === 0) shape.moveTo(lon, lat);
-        else shape.lineTo(lon, lat);
-      });
-
-      // On garde la même hauteur de "plateau" visible (sommet à 5.08, comme
-      // avant), mais on prolonge bien plus profondément la base du pays
-      // (jusqu'à 4.8, sous la surface de l'océan à 4.85). Avant, la base
-      // s'arrêtait à 5.0, laissant un vide de 0.15 unité entre le dessous du
-      // pays et la mer — visible sous certains angles de caméra comme un
-      // effet de "terre qui flotte". Maintenant les "racines" du pays
-      // plongent dans l'océan, donc plus aucun vide n'est visible.
-      // Sommet du plateau à 4.95 (seulement 0.10 au-dessus de l'océan à 4.85,
-      // au lieu de 0.23 avant — moins de "marche" visible entre mer et
-      // terre), racines toujours submergées à 4.75 (0.10 sous l'océan) pour
-      // qu'aucun vide ne soit visible sous le pays.
-      const extrudeSettings = { depth: 0.2, bevelEnabled: false };
-      let meshGeom = new THREE.ExtrudeGeometry(shape, extrudeSettings);
-      meshGeom = subdivideFlatGeometry(meshGeom, 2.2);
-      projectGeometryToSphere(meshGeom, 4.75);
-
-      const borderPoints = [];
-      outerRing.forEach(([lon, lat]) => {
-        const r = 4.952; 
-        const phi = (90 - lat) * (Math.PI / 180);
-        const theta = (lon + 180) * (Math.PI / 180);
-        const x = -(r * Math.sin(phi) * Math.cos(theta));
-        const z = (r * Math.sin(phi) * Math.sin(theta));
-        const y = (r * Math.cos(phi));
-        borderPoints.push(new THREE.Vector3(x, y, z));
-      });
-      const lineGeom = new THREE.BufferGeometry().setFromPoints(borderPoints);
-
-      parts.push({ meshGeom, lineGeom });
+    idbGetGeometry(countryId).then((cached) => {
+      if (cancelled) return;
+      if (cached) {
+        // Cache trouvé : reconstruction quasi instantanée, on saute tout le
+        // calcul de subdivision/triangulation.
+        setGeometries(geometryPartsFromCache(cached));
+        return;
+      }
+      // Pas de cache : calcul normal (identique à avant), puis on sauvegarde
+      // le résultat pour que le prochain chargement soit instantané.
+      const parts = buildCountryGeometryParts(feature);
+      setGeometries(parts);
+      idbSetGeometry(countryId, geometryPartsToCache(parts));
     });
-    return parts;
+
+    return () => { cancelled = true; };
   }, [feature]);
 
   const countryName = feature.properties.name || 'Pays inconnu';
   const isHighlighted = hovered || countryName === activeCountry;
   const displayColor = isHighlighted ? (countryColorsData[countryName] || '#FACC15') : '#4ADE80';
+
+  if (!geometries) return null;
 
   return (
     <group
@@ -1405,13 +1671,15 @@ const GlobeWithCountries = ({ onHoverCountry, onClickCountry, setCountriesData, 
   const [countries, setCountries] = useState([]);
 
   useEffect(() => {
-    fetch('https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json')
-      .then((res) => res.json())
+    let cancelled = false;
+    fetchGeoJSONInWorker('https://raw.githubusercontent.com/johan/world.geo.json/master/countries.geo.json')
       .then((data) => {
+        if (cancelled) return;
         setCountries(data.features);
         if (setCountriesData) setCountriesData(data.features);
       })
       .catch((err) => console.error('Erreur GeoJSON:', err));
+    return () => { cancelled = true; };
   }, [setCountriesData]);
 
   return (
@@ -1458,6 +1726,36 @@ const SettingsButton = ({ onClick }) => (
     }}
   >
     ⚙️
+  </button>
+);
+
+const StatsButton = ({ onClick }) => (
+  <button
+    onClick={onClick}
+    title="Statistiques"
+    style={{
+      position: 'absolute', bottom: 30, right: 86, zIndex: 10, width: 46, height: 46,
+      borderRadius: '50%', border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(15,23,42,0.85)',
+      color: '#fff', fontSize: 20, cursor: 'pointer', backdropFilter: 'blur(10px)',
+      boxShadow: '0 10px 15px -3px rgba(0,0,0,0.3)',
+    }}
+  >
+    📊
+  </button>
+);
+
+const MuteButton = ({ muted, onClick }) => (
+  <button
+    onClick={onClick}
+    title={muted ? 'Réactiver le son' : 'Couper le son'}
+    style={{
+      position: 'absolute', bottom: 30, right: 142, zIndex: 10, width: 46, height: 46,
+      borderRadius: '50%', border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(15,23,42,0.85)',
+      color: '#fff', fontSize: 20, cursor: 'pointer', backdropFilter: 'blur(10px)',
+      boxShadow: '0 10px 15px -3px rgba(0,0,0,0.3)',
+    }}
+  >
+    {muted ? '🔇' : '🔊'}
   </button>
 );
 
@@ -1573,12 +1871,17 @@ const SettingsPanel = ({ settings, setSettings, onClose, onExport, onImport, onR
 
         {/* Son */}
         <div style={{ marginBottom: 24 }}>
-          <p style={sectionTitle}>Son <span style={{ opacity: 0.5, textTransform: 'none' }}>(pas encore implémenté)</span></p>
+          <p style={sectionTitle}>Son</p>
+          <label style={row}>
+            <span>Couper le son</span>
+            <input type="checkbox" checked={settings.soundMuted} onChange={(e) => update({ soundMuted: e.target.checked })} />
+          </label>
           <div style={row}>
             <span>Volume général</span>
             <input
               type="range" min={0} max={1} step={0.05} value={settings.soundMaster}
               onChange={(e) => update({ soundMaster: parseFloat(e.target.value) })}
+              disabled={settings.soundMuted}
               style={{ width: 120 }}
             />
           </div>
@@ -1587,16 +1890,13 @@ const SettingsPanel = ({ settings, setSettings, onClose, onExport, onImport, onR
             <input type="checkbox" checked={settings.soundFootsteps} onChange={(e) => update({ soundFootsteps: e.target.checked })} />
           </label>
           <label style={row}>
-            <span>Rames sur l'eau</span>
+            <span>Sons de l'eau</span>
             <input type="checkbox" checked={settings.soundOars} onChange={(e) => update({ soundOars: e.target.checked })} />
           </label>
           <label style={row}>
             <span>Plantation de drapeau</span>
             <input type="checkbox" checked={settings.soundFlag} onChange={(e) => update({ soundFlag: e.target.checked })} />
           </label>
-          <p style={{ fontSize: 11, opacity: 0.5, margin: '4px 0 0 0' }}>
-            Ces réglages sont déjà sauvegardés et prêts — les sons eux-mêmes arriveront dans une prochaine mise à jour.
-          </p>
         </div>
 
         {/* Données */}
@@ -1647,6 +1947,458 @@ const SettingsPanel = ({ settings, setSettings, onClose, onExport, onImport, onR
   );
 };
 
+// --- Son (généré procéduralement, aucun fichier audio à charger) ---------
+// Web Audio API pure : bruit filtré pour les pas/rames, deux notes courtes
+// pour la plantation de drapeau, et un léger bruit filtré en boucle pour
+// l'ambiance. Le contexte audio ne peut démarrer qu'après un geste
+// utilisateur (politique des navigateurs), donc on l'initialise au premier
+// clic/touche plutôt qu'au montage.
+const SoundCtx = React.createContext(null);
+
+function makeNoiseBuffer(actx, duration) {
+  const bufferSize = Math.max(1, Math.floor(actx.sampleRate * duration));
+  const buffer = actx.createBuffer(1, bufferSize, actx.sampleRate);
+  const data = buffer.getChannelData(0);
+  for (let i = 0; i < bufferSize; i++) data[i] = Math.random() * 2 - 1;
+  return buffer;
+}
+
+const SoundProvider = ({ settings, children }) => {
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  const actxRef = useRef(null);
+  const masterGainRef = useRef(null);
+  const ambientGainRef = useRef(null);
+
+  const effectiveMaster = () => (settingsRef.current.soundMuted ? 0 : settingsRef.current.soundMaster);
+
+  const startAmbient = (actx, master) => {
+    const src = actx.createBufferSource();
+    src.buffer = makeNoiseBuffer(actx, 4);
+    src.loop = true;
+    const filter = actx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 450;
+    const gain = actx.createGain();
+    gain.gain.value = effectiveMaster() * 0.16;
+    src.connect(filter).connect(gain).connect(master);
+    src.start();
+    ambientGainRef.current = gain;
+  };
+
+  const ensureContext = () => {
+    if (!actxRef.current) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) return null;
+      const actx = new Ctx();
+      const master = actx.createGain();
+      master.gain.value = effectiveMaster();
+      master.connect(actx.destination);
+      actxRef.current = actx;
+      masterGainRef.current = master;
+      startAmbient(actx, master);
+    } else if (actxRef.current.state === 'suspended') {
+      actxRef.current.resume();
+    }
+    return actxRef.current;
+  };
+
+  // Démarre (ou reprend) le contexte audio dès la première interaction.
+  useEffect(() => {
+    const resume = () => ensureContext();
+    window.addEventListener('keydown', resume);
+    window.addEventListener('pointerdown', resume);
+    return () => {
+      window.removeEventListener('keydown', resume);
+      window.removeEventListener('pointerdown', resume);
+    };
+  }, []);
+
+  // Répercute les changements de volume/mute en direct.
+  useEffect(() => {
+    if (masterGainRef.current) masterGainRef.current.gain.value = effectiveMaster();
+    if (ambientGainRef.current) ambientGainRef.current.gain.value = effectiveMaster() * 0.16;
+  }, [settings.soundMaster, settings.soundMuted]);
+
+  const playFootstep = () => {
+    if (!settingsRef.current.soundFootsteps) return;
+    const actx = actxRef.current;
+    if (!actx) return;
+    const src = actx.createBufferSource();
+    src.buffer = makeNoiseBuffer(actx, 0.07);
+    const filter = actx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = 650 + Math.random() * 200;
+    const gain = actx.createGain();
+    gain.gain.setValueAtTime(0.45, actx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, actx.currentTime + 0.08);
+    src.connect(filter).connect(gain).connect(masterGainRef.current);
+    src.start();
+  };
+
+  const waterAmbientRef = useRef(null);
+
+  const playOar = () => {
+    if (!settingsRef.current.soundOars) return;
+    const actx = actxRef.current;
+    if (!actx) return;
+    // Un vrai "plouf" d'eau : un bref pic net suivi d'un bruit passe-bande
+    // qui descend (l'écume/les bulles), plutôt qu'un thud grave — c'est ce
+    // thud qui sonnait comme un pas sur une planche de bois.
+    const now = actx.currentTime;
+    const duration = 0.4;
+    const src = actx.createBufferSource();
+    src.buffer = makeNoiseBuffer(actx, duration);
+    const filter = actx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.Q.value = 0.9;
+    filter.frequency.setValueAtTime(2400, now);
+    filter.frequency.exponentialRampToValueAtTime(700, now + 0.32);
+    const gain = actx.createGain();
+    gain.gain.setValueAtTime(0.0001, now);
+    gain.gain.exponentialRampToValueAtTime(0.17, now + 0.008);
+    gain.gain.exponentialRampToValueAtTime(0.0001, now + duration);
+    src.connect(filter).connect(gain).connect(masterGainRef.current);
+    src.start();
+    src.stop(now + duration + 0.02);
+  };
+
+  // Ambiance d'eau continue tant qu'on est sur la mer (pas juste un bruit à
+  // chaque coup de rame) : bruit filtré passe-bande dont la fréquence
+  // "respire" via un LFO lent, pour un clapotis irrégulier plutôt qu'un son
+  // figé. Démarrée/arrêtée depuis Player au changement d'état terre/eau.
+  const startWaterAmbient = () => {
+    if (!settingsRef.current.soundOars) return;
+    const actx = ensureContext();
+    if (!actx || waterAmbientRef.current) return;
+    const src = actx.createBufferSource();
+    src.buffer = makeNoiseBuffer(actx, 4);
+    src.loop = true;
+    const filter = actx.createBiquadFilter();
+    filter.type = 'bandpass';
+    filter.frequency.value = 700;
+    filter.Q.value = 0.6;
+    const lfo = actx.createOscillator();
+    lfo.frequency.value = 0.18;
+    const lfoGain = actx.createGain();
+    lfoGain.gain.value = 220;
+    lfo.connect(lfoGain).connect(filter.frequency);
+    lfo.start();
+    const gain = actx.createGain();
+    gain.gain.setValueAtTime(0, actx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.09, actx.currentTime + 0.6);
+    src.connect(filter).connect(gain).connect(masterGainRef.current);
+    src.start();
+    waterAmbientRef.current = { src, lfo, gain };
+  };
+
+  const stopWaterAmbient = () => {
+    const nodes = waterAmbientRef.current;
+    if (!nodes || !actxRef.current) return;
+    const actx = actxRef.current;
+    nodes.gain.gain.cancelScheduledValues(actx.currentTime);
+    nodes.gain.gain.setValueAtTime(nodes.gain.gain.value, actx.currentTime);
+    nodes.gain.gain.linearRampToValueAtTime(0, actx.currentTime + 0.4);
+    waterAmbientRef.current = null;
+    setTimeout(() => {
+      try { nodes.src.stop(); nodes.lfo.stop(); } catch { /* déjà arrêté */ }
+    }, 450);
+  };
+
+  // Coupe l'ambiance d'eau immédiatement si l'utilisateur désactive ce son
+  // en cours de route, plutôt que d'attendre le prochain changement terre/eau.
+  useEffect(() => {
+    if (!settings.soundOars) stopWaterAmbient();
+  }, [settings.soundOars]);
+
+  const playFlagPlant = () => {
+    if (!settingsRef.current.soundFlag) return;
+    const actx = actxRef.current;
+    if (!actx) return;
+    [523.25, 659.25].forEach((freq, i) => {
+      const osc = actx.createOscillator();
+      osc.type = 'triangle';
+      osc.frequency.value = freq;
+      const gain = actx.createGain();
+      const start = actx.currentTime + i * 0.09;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.28, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.3);
+      osc.connect(gain).connect(masterGainRef.current);
+      osc.start(start);
+      osc.stop(start + 0.32);
+    });
+  };
+
+  return (
+    <SoundCtx.Provider value={{ playFootstep, playOar, playFlagPlant, startWaterAmbient, stopWaterAmbient }}>
+      {children}
+    </SoundCtx.Provider>
+  );
+};
+
+function useSound() {
+  return useContext(SoundCtx) || { playFootstep: () => {}, playOar: () => {}, playFlagPlant: () => {}, startWaterAmbient: () => {}, stopWaterAmbient: () => {} };
+}
+
+// Convertit un cap en degrés (0 = Nord, sens horaire) en abréviation cardinale.
+function headingToCardinal(deg) {
+  const dirs = ['N', 'NE', 'E', 'SE', 'S', 'SO', 'O', 'NO'];
+  return dirs[Math.round(deg / 45) % 8];
+}
+
+// Boussole : cadran SVG fixe (les points cardinaux ne bougent jamais) avec
+// une aiguille qui pivote pour indiquer la direction actuellement pointée
+// par le personnage. Cap validé numériquement (N=0°, E=90°, S=180°, O=270°).
+//
+// IMPORTANT côté perf : ce composant ne reçoit PAS le cap via une prop
+// React qui changerait à chaque frame (ça forçait un re-render de toute
+// l'appli 60x/seconde et faisait ramer tout le jeu). Il reçoit une *ref*
+// mutable mise à jour en continu par Player, et anime lui-même l'aiguille
+// via sa propre boucle requestAnimationFrame en modifiant directement les
+// attributs du DOM — React n'est jamais sollicité pour ces mises à jour.
+const Compass = ({ headingRef }) => {
+  const needleRef = useRef(null);
+  const labelRef = useRef(null);
+  const lastDrawn = useRef(null);
+  const CX = 50, CY = 50;
+
+  useEffect(() => {
+    let rafId;
+    const tick = () => {
+      const heading = headingRef?.current ?? 0;
+      // On ne touche au DOM que si le cap a vraiment changé (évite un
+      // travail de layout/paint inutile quand le joueur est immobile).
+      if (lastDrawn.current === null || Math.abs(heading - lastDrawn.current) > 0.05) {
+        lastDrawn.current = heading;
+        if (needleRef.current) {
+          needleRef.current.setAttribute('transform', `rotate(${heading} ${CX} ${CY})`);
+        }
+        if (labelRef.current) {
+          labelRef.current.textContent = `${Math.round(heading).toString().padStart(3, '0')}° ${headingToCardinal(heading)}`;
+        }
+      }
+      rafId = requestAnimationFrame(tick);
+    };
+    rafId = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(rafId);
+  }, [headingRef]);
+
+  const R = 42;
+  const ticks = Array.from({ length: 12 }, (_, i) => i * 30);
+  const cardinalLabels = [
+    { deg: 0, text: 'N', color: '#4ADE80', size: 13 },
+    { deg: 90, text: 'E', color: '#cbd5e1', size: 10 },
+    { deg: 180, text: 'S', color: '#cbd5e1', size: 10 },
+    { deg: 270, text: 'O', color: '#cbd5e1', size: 10 },
+  ];
+  const toXY = (deg, radius) => {
+    const rad = ((deg - 90) * Math.PI) / 180; // 0° = haut du cadran
+    return [CX + Math.cos(rad) * radius, CY + Math.sin(rad) * radius];
+  };
+
+  return (
+    <div
+      style={{
+        position: 'absolute', top: '50%', left: 30, transform: 'translateY(-50%)', zIndex: 10,
+        width: 108, background: 'linear-gradient(160deg, rgba(30,41,59,0.9), rgba(15,23,42,0.9))',
+        border: '1px solid rgba(255,255,255,0.12)', borderRadius: 16,
+        backdropFilter: 'blur(10px)', boxShadow: '0 10px 25px -5px rgba(0,0,0,0.5), inset 0 1px 0 rgba(255,255,255,0.06)',
+        padding: '10px 8px 8px', display: 'flex', flexDirection: 'column', alignItems: 'center', color: '#fff',
+        pointerEvents: 'none',
+      }}
+    >
+      <svg width="92" height="92" viewBox="0 0 100 100">
+        <defs>
+          <radialGradient id="compassFace" cx="50%" cy="42%" r="65%">
+            <stop offset="0%" stopColor="#1e293b" />
+            <stop offset="100%" stopColor="#0b1220" />
+          </radialGradient>
+          <filter id="needleShadow" x="-50%" y="-50%" width="200%" height="200%">
+            <feDropShadow dx="0" dy="0.6" stdDeviation="0.8" floodColor="#000" floodOpacity="0.5" />
+          </filter>
+        </defs>
+
+        <circle cx={CX} cy={CY} r={R} fill="url(#compassFace)" stroke="rgba(255,255,255,0.15)" strokeWidth="1.5" />
+        <circle cx={CX} cy={CY} r={R - 5} fill="none" stroke="rgba(255,255,255,0.06)" strokeWidth="1" />
+
+        {ticks.map((deg) => {
+          const major = deg % 90 === 0;
+          const [x1, y1] = toXY(deg, R - 2);
+          const [x2, y2] = toXY(deg, major ? R - 9 : R - 6);
+          return (
+            <line key={deg} x1={x1} y1={y1} x2={x2} y2={y2}
+              stroke={major ? 'rgba(74,222,128,0.7)' : 'rgba(255,255,255,0.25)'}
+              strokeWidth={major ? 1.6 : 1} strokeLinecap="round" />
+          );
+        })}
+
+        {cardinalLabels.map(({ deg, text, color, size }) => {
+          const [x, y] = toXY(deg, R - 15);
+          return (
+            <text key={text} x={x} y={y + size * 0.35} textAnchor="middle"
+              fontSize={size} fontWeight="bold" fill={color} fontFamily="system-ui, sans-serif">
+              {text}
+            </text>
+          );
+        })}
+
+        {/* Aiguille à deux tons (rouge = nord, clair = sud) — la rotation est
+            appliquée impérativement (voir useEffect ci-dessus), pas via une prop React. */}
+        <g ref={needleRef} filter="url(#needleShadow)">
+          <polygon points={`${CX},${CY - 27} ${CX - 4.5},${CY} ${CX},${CY - 5} ${CX + 4.5},${CY}`} fill="#EF4444" />
+          <polygon points={`${CX},${CY + 20} ${CX - 4.5},${CY} ${CX},${CY + 5} ${CX + 4.5},${CY}`} fill="#cbd5e1" />
+        </g>
+        <circle cx={CX} cy={CY} r="4" fill="#f8fafc" stroke="#0b1220" strokeWidth="1.5" />
+      </svg>
+
+      <div ref={labelRef} style={{ fontSize: 12, fontWeight: 600, marginTop: 2, letterSpacing: 0.3 }}>
+        000° N
+      </div>
+    </div>
+  );
+};
+
+// Barre de recherche : tape le nom d'un pays, sélectionne une suggestion (ou
+// Entrée si un seul résultat), le joueur y est téléporté directement.
+const SearchBar = ({ countriesData, onSelect }) => {
+  const [query, setQuery] = useState('');
+  const [open, setOpen] = useState(false);
+
+  const matches = query.trim().length > 0
+    ? countriesData
+        .filter((f) => (f.properties.name || '').toLowerCase().includes(query.trim().toLowerCase()))
+        .slice(0, 8)
+    : [];
+
+  const select = (feature) => {
+    onSelect(feature);
+    setQuery(feature.properties.name);
+    setOpen(false);
+  };
+
+  return (
+    <div style={{ position: 'absolute', top: 30, left: '50%', transform: 'translateX(-50%)', zIndex: 20, width: 280 }}>
+      <input
+        value={query}
+        onChange={(e) => { setQuery(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && matches.length > 0) select(matches[0]);
+          if (e.key === 'Escape') setOpen(false);
+        }}
+        placeholder="🔍 Sauter à un pays..."
+        style={{
+          width: '100%', boxSizing: 'border-box', padding: '10px 14px', borderRadius: 10,
+          border: '1px solid rgba(255,255,255,0.15)', background: 'rgba(15,23,42,0.85)',
+          color: '#fff', fontSize: 14, backdropFilter: 'blur(10px)', outline: 'none',
+        }}
+      />
+      {open && matches.length > 0 && (
+        <div style={{
+          marginTop: 6, background: 'rgba(15,23,42,0.97)', border: '1px solid rgba(255,255,255,0.15)',
+          borderRadius: 10, overflow: 'hidden', boxShadow: '0 10px 25px rgba(0,0,0,0.4)',
+        }}>
+          {matches.map((f) => (
+            <div
+              key={f.id || f.properties.name}
+              onClick={() => select(f)}
+              style={{ padding: '9px 14px', fontSize: 13, color: '#fff', cursor: 'pointer' }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = 'rgba(74,222,128,0.15)'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+            >
+              {f.properties.name}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+const StatsPanel = ({ visitedFlags, countriesData, onClose, onShareCard, cardExporting }) => {
+  const total = countriesData.length || 180;
+  const pct = total ? Math.round((visitedFlags.length / total) * 100) : 0;
+
+  const continentTotals = {};
+  countriesData.forEach((f) => {
+    const c = COUNTRY_CONTINENTS[f.properties.name] || 'Autre';
+    continentTotals[c] = (continentTotals[c] || 0) + 1;
+  });
+  const continentVisited = {};
+  visitedFlags.forEach((f) => {
+    const c = COUNTRY_CONTINENTS[f.country] || 'Autre';
+    continentVisited[c] = (continentVisited[c] || 0) + 1;
+  });
+  const continents = Object.keys(continentTotals).sort((a, b) => (continentVisited[b] || 0) - (continentVisited[a] || 0));
+
+  const rated = [...visitedFlags].filter((f) => f.rating > 0).sort((a, b) => b.rating - a.rating);
+
+  const row = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '7px 0', fontSize: 14 };
+  const sectionTitle = { fontSize: 13, textTransform: 'uppercase', letterSpacing: 0.6, opacity: 0.6, margin: '0 0 10px 0' };
+
+  return (
+    <div
+      style={{ position: 'absolute', inset: 0, zIndex: 200, background: 'rgba(0,0,0,0.6)', display: 'flex', alignItems: 'center', justifyContent: 'center', animation: 'panelFadeIn 0.2s ease-out' }}
+      onClick={onClose}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{ width: 420, maxWidth: '92vw', maxHeight: '85vh', overflowY: 'auto', background: 'rgba(15,23,42,0.97)', border: '1px solid rgba(255,255,255,0.15)', borderRadius: 16, padding: 24, color: '#fff', boxShadow: '0 20px 40px rgba(0,0,0,0.5)' }}
+      >
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 20 }}>
+          <h2 style={{ margin: 0, fontSize: 20 }}>📊 Statistiques</h2>
+          <button onClick={onClose} style={{ background: 'none', border: 'none', color: '#fff', fontSize: 20, cursor: 'pointer' }}>✕</button>
+        </div>
+
+        <div style={{ textAlign: 'center', marginBottom: 24 }}>
+          <div style={{ fontSize: 42, fontWeight: 800, color: '#4ADE80' }}>{pct}%</div>
+          <div style={{ fontSize: 13, opacity: 0.7 }}>{visitedFlags.length} pays visités sur {total}</div>
+        </div>
+
+        <div style={{ marginBottom: 24 }}>
+          <p style={sectionTitle}>Par continent</p>
+          {continents.map((c) => {
+            const v = continentVisited[c] || 0;
+            const t = continentTotals[c];
+            return (
+              <div key={c} style={row}>
+                <span>{c}</span>
+                <span style={{ opacity: 0.8 }}>{v} / {t}</span>
+              </div>
+            );
+          })}
+        </div>
+
+        <div style={{ marginBottom: 24 }}>
+          <p style={sectionTitle}>Meilleurs pays notés</p>
+          {rated.length === 0 && <p style={{ fontSize: 13, opacity: 0.5, margin: 0 }}>Aucune note pour le moment.</p>}
+          {rated.slice(0, 5).map((f) => (
+            <div key={f.country} style={row}>
+              <span>{f.country}</span>
+              <span style={{ color: '#FACC15' }}>⭐ {f.rating}/10</span>
+            </div>
+          ))}
+        </div>
+
+        <button
+          onClick={onShareCard}
+          disabled={cardExporting || visitedFlags.length === 0}
+          style={{
+            width: '100%', padding: '10px 12px', borderRadius: 8, border: 'none',
+            background: visitedFlags.length === 0 ? 'rgba(255,255,255,0.1)' : '#4ADE80',
+            color: visitedFlags.length === 0 ? 'rgba(255,255,255,0.4)' : '#000',
+            fontWeight: 'bold', cursor: visitedFlags.length === 0 ? 'default' : 'pointer',
+          }}
+        >
+          {cardExporting ? 'Génération...' : '📸 Partager ma carte de voyage'}
+        </button>
+      </div>
+    </div>
+  );
+};
+
 const TravelPortfolioScene = () => {
   const [hoveredCountry, setHoveredCountry] = useState(null);
   const [selectedCountry, setSelectedCountry] = useState(null);
@@ -1672,7 +2424,137 @@ const TravelPortfolioScene = () => {
   const [settings, setSettings] = useState(loadSettings);
   const [showSettings, setShowSettings] = useState(false);
 
+  // Recherche / téléportation directe vers un pays
+  const [teleportTarget, setTeleportTarget] = useState(null);
+  const headingRef = useRef(0);
+
+  // Statistiques et export de la carte de voyage
+  const [showStats, setShowStats] = useState(false);
+  const [cardExporting, setCardExporting] = useState(false);
+
   const cameraLocked = !!activePopupFlag || returningCamera;
+
+  const jumpToCountry = (feature) => {
+    const point = getCountryWalkPoint(feature);
+    if (point) setTeleportTarget(point);
+  };
+
+  // Compose une image récap ("carte de voyage") à partir des pays visités,
+  // et propose de la partager (Web Share API) ou de la télécharger sinon.
+  const shareTravelCard = async () => {
+    setCardExporting(true);
+    try {
+      const W = 1080, H = 1350;
+      const canvas = document.createElement('canvas');
+      canvas.width = W;
+      canvas.height = H;
+      const ctx = canvas.getContext('2d');
+
+      const bg = ctx.createLinearGradient(0, 0, 0, H);
+      bg.addColorStop(0, '#0b0620');
+      bg.addColorStop(1, '#1e1140');
+      ctx.fillStyle = bg;
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.textAlign = 'center';
+      ctx.fillStyle = '#fff';
+      ctx.font = 'bold 54px system-ui, sans-serif';
+      ctx.fillText('🌍 Mon carnet de voyage', W / 2, 110);
+
+      const total = countriesData.length || 180;
+      const pct = total ? Math.round((visitedFlags.length / total) * 100) : 0;
+      ctx.font = '600 34px system-ui, sans-serif';
+      ctx.fillStyle = '#4ADE80';
+      ctx.fillText(`${visitedFlags.length} pays visités  •  ${pct}% du monde`, W / 2, 165);
+
+      const rated = visitedFlags.filter((f) => f.rating > 0).sort((a, b) => b.rating - a.rating)[0];
+      if (rated) {
+        ctx.font = '28px system-ui, sans-serif';
+        ctx.fillStyle = 'rgba(255,255,255,0.75)';
+        ctx.fillText(`⭐ Coup de cœur : ${rated.country} (${rated.rating}/10)`, W / 2, 205);
+      }
+
+      // Mosaïque de quelques photos de voyage (si disponibles)
+      const allPhotos = visitedFlags.flatMap((f) => f.photos || []).slice(0, 6);
+      let y = 240;
+      if (allPhotos.length > 0) {
+        const cols = 3;
+        const gap = 12;
+        const cellW = (W - 80 - gap * (cols - 1)) / cols;
+        const cellH = cellW * 0.75;
+        const images = await Promise.all(allPhotos.map((src) => new Promise((resolve) => {
+          const img = new Image();
+          img.onload = () => resolve(img);
+          img.onerror = () => resolve(null);
+          img.src = src;
+        })));
+        images.forEach((img, i) => {
+          if (!img) return;
+          const col = i % cols;
+          const row = Math.floor(i / cols);
+          const x = 40 + col * (cellW + gap);
+          const cy = y + row * (cellH + gap);
+          ctx.save();
+          ctx.beginPath();
+          ctx.roundRect(x, cy, cellW, cellH, 14);
+          ctx.clip();
+          // Recadrage centré façon object-fit: cover
+          const scale = Math.max(cellW / img.width, cellH / img.height);
+          const dw = img.width * scale, dh = img.height * scale;
+          ctx.drawImage(img, x + (cellW - dw) / 2, cy + (cellH - dh) / 2, dw, dh);
+          ctx.restore();
+        });
+        y += Math.ceil(allPhotos.length / cols) * (cellH + gap) + 30;
+      }
+
+      // Liste des pays visités (chips)
+      ctx.font = '600 24px system-ui, sans-serif';
+      ctx.textAlign = 'left';
+      const names = visitedFlags.map((f) => f.country);
+      const shown = names.slice(0, 30);
+      let cx = 40, cy2 = y;
+      const rowH = 46;
+      shown.forEach((name) => {
+        const w = ctx.measureText(name).width + 32;
+        if (cx + w > W - 40) { cx = 40; cy2 += rowH; }
+        if (cy2 > H - 120) return;
+        ctx.fillStyle = 'rgba(255,255,255,0.1)';
+        ctx.beginPath();
+        ctx.roundRect(cx, cy2 - 30, w, 36, 18);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(name, cx + 16, cy2 - 6);
+        cx += w + 10;
+      });
+      if (names.length > shown.length) {
+        ctx.fillStyle = 'rgba(255,255,255,0.6)';
+        ctx.fillText(`+ ${names.length - shown.length} autres`, cx + 4, cy2 - 6);
+      }
+
+      ctx.textAlign = 'center';
+      ctx.font = '20px system-ui, sans-serif';
+      ctx.fillStyle = 'rgba(255,255,255,0.4)';
+      ctx.fillText('Généré avec Countries Been', W / 2, H - 30);
+
+      const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/png'));
+      const file = new File([blob], 'ma-carte-de-voyage.png', { type: 'image/png' });
+
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Mon carnet de voyage' });
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'ma-carte-de-voyage.png';
+        a.click();
+        URL.revokeObjectURL(url);
+      }
+    } catch (err) {
+      if (err?.name !== 'AbortError') console.error('Erreur export carte de voyage :', err);
+    } finally {
+      setCardExporting(false);
+    }
+  };
 
   useEffect(() => { saveSettings(settings); }, [settings]);
 
@@ -1854,58 +2736,77 @@ const TravelPortfolioScene = () => {
       </div>
 
       <Canvas shadows={settings.shadows} camera={{ position: [0, 0, 14], fov: 45 }}>
-        <ambientLight intensity={0.28} />
-        <RotatingSun />
-        <directionalLight position={[-10, -10, -5]} intensity={0.12} color="#90b0d0" />
+        <SoundProvider settings={settings}>
+          <ambientLight intensity={0.28} />
+          <RotatingSun />
+          <directionalLight position={[-10, -10, -5]} intensity={0.12} color="#90b0d0" />
 
-        <NebulaSky />
-        <Stars radius={85} depth={50} count={3000} factor={4} fade />
-        
-        <Player 
-          countriesData={countriesData}
-          onWaterChange={setIsOnWater}
-          onLocationChange={(countryName) => setSelectedCountry(countryName)}
-          onPlantFlag={handlePlantFlag}
-          visitedFlags={visitedFlags}
-          cameraLocked={cameraLocked}
-          keybindings={settings.keybindings}
-          reduceMotion={settings.reduceMotion}
-        />
-
-        <GlobeWithCountries 
-          onHoverCountry={setHoveredCountry} 
-          onClickCountry={(name) => {
-            // Cliquer sur un pays déjà visité ouvre directement sa fiche.
-            // Le déplacement se fait uniquement au clavier désormais.
-            if (visitedFlags.some(f => f.country === name)) openCountryNote(name);
-          }} 
-          setCountriesData={setCountriesData}
-          activeCountry={selectedCountry}
-        />
-
-        {visitedFlags.map((flag, idx) => (
-          <FlagMarker 
-            key={idx} 
-            position={flag.position} 
-            countryName={flag.country} 
-            onClick={openCountryNote} 
+          <NebulaSky />
+          <Stars radius={85} depth={50} count={3000} factor={4} fade />
+          
+          <Player 
+            countriesData={countriesData}
+            onWaterChange={setIsOnWater}
+            onLocationChange={(countryName) => setSelectedCountry(countryName)}
+            onPlantFlag={handlePlantFlag}
+            visitedFlags={visitedFlags}
+            cameraLocked={cameraLocked}
+            keybindings={settings.keybindings}
+            reduceMotion={settings.reduceMotion}
+            teleportTarget={teleportTarget}
+            headingRef={headingRef}
           />
-        ))}
 
-        <CameraFocusRig focusFlag={activePopupFlag} onSettled={() => setReturningCamera(false)} />
-        <CountryZoomLabel flag={activePopupFlag} />
-        {settings.bloom && (
-          <EffectComposer>
-            <Bloom
-              luminanceThreshold={0.35}
-              luminanceSmoothing={0.9}
-              intensity={0.9}
-              mipmapBlur
+          <GlobeWithCountries 
+            onHoverCountry={setHoveredCountry} 
+            onClickCountry={(name) => {
+              // Cliquer sur un pays déjà visité ouvre directement sa fiche.
+              // Le déplacement se fait uniquement au clavier désormais.
+              if (visitedFlags.some(f => f.country === name)) openCountryNote(name);
+            }} 
+            setCountriesData={setCountriesData}
+            activeCountry={selectedCountry}
+          />
+
+          {visitedFlags.map((flag, idx) => (
+            <FlagMarker 
+              key={idx} 
+              position={flag.position} 
+              countryName={flag.country} 
+              onClick={openCountryNote} 
             />
-          </EffectComposer>
-        )}
+          ))}
+
+          <CameraFocusRig focusFlag={activePopupFlag} onSettled={() => setReturningCamera(false)} />
+          <CountryZoomLabel flag={activePopupFlag} />
+          {settings.bloom && (
+            <EffectComposer>
+              <Bloom
+                luminanceThreshold={0.35}
+                luminanceSmoothing={0.9}
+                intensity={0.9}
+                mipmapBlur
+              />
+            </EffectComposer>
+          )}
+        </SoundProvider>
       </Canvas>
 
+      <SearchBar countriesData={countriesData} onSelect={jumpToCountry} />
+      <Compass headingRef={headingRef} />
+
+      <StatsButton onClick={() => setShowStats(true)} />
+      {showStats && (
+        <StatsPanel
+          visitedFlags={visitedFlags}
+          countriesData={countriesData}
+          onClose={() => setShowStats(false)}
+          onShareCard={shareTravelCard}
+          cardExporting={cardExporting}
+        />
+      )}
+
+      <MuteButton muted={settings.soundMuted} onClick={() => setSettings((prev) => ({ ...prev, soundMuted: !prev.soundMuted }))} />
       <SettingsButton onClick={() => setShowSettings(true)} />
       {showSettings && (
         <SettingsPanel
